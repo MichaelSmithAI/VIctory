@@ -154,7 +154,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -2896,7 +2896,7 @@ impl<'a> Lower<'a> {
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
+            Fields::Image { dim, dmask, .. } => {
                 let kind = match dim {
                     0 => 1,
                     1 => 2,
@@ -2905,7 +2905,12 @@ impl<'a> Lower<'a> {
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                let component = if un == "image_atomic_cmpswap" && *dmask == 15 {
+                    0x105
+                } else {
+                    0x409
+                };
+                ((kind | u, component), Some(kind))
             }
             Fields::Buffer { idxen, format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
@@ -3234,7 +3239,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props.0, props.1);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
