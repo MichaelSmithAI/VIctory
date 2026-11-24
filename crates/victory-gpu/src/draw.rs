@@ -956,7 +956,9 @@ impl State {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let view = table
                             .checked_add(u64::from(u.table_offset_dwords) * 4)
-                            .filter(|&handle| self.heap_of(handle).is_some())
+                            .filter(|&handle| {
+                                self.heap_of(handle).is_some_and(|heap| heap.has_view_slot(handle))
+                            })
                             .and_then(crate::descriptor::view);
                         describe(view.as_ref())
                     }
