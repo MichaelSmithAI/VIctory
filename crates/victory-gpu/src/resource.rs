@@ -1366,6 +1366,207 @@ mod tests {
         visible_nodes: 0,
     };
 
+    #[cfg(windows)]
+    #[test]
+    fn nested_placed_buffer_srv_reads_the_parent_shadow() {
+        use victory_shader::native::{ComputeIo, HwStage, StageIo};
+        use victory_shader::{Container, NativeProgram, ResourceType, RootParam, RootType, UsedResource};
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let null = std::ptr::null();
+        const A: u32 = 0xA0A0_0001;
+        const B: u32 = 0xB0B0_0002;
+        const B2: u32 = 0xB0B0_0003;
+        const SENTINEL: u32 = 0x5EE0_5EE0;
+        // The program: s0 = input table byte address, s1 = output table.
+        let s_mov = |dst: u32, src: u32| 0xBE80_0300 | dst << 16 | src;
+        let mubuf = |op: u32, vdata: u32, vaddr: u32, srsrc: u32| -> [u32; 2] {
+            [0x38 << 26 | op << 18 | 1 << 13, 0x80 << 24 | (srsrc >> 2) << 16 | vdata << 8 | vaddr]
+        };
+        const LOAD: u32 = 0x0C;
+        const STORE: u32 = 0x1C;
+        let mut words = vec![
+            s_mov(4, 0),
+            s_mov(5, 0x80), // s5 = 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (entry 1)
+            s_mov(6, 1),
+            s_mov(7, 0x80), // s7 = 0
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0 (output table)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E06_0281, // v_mov_b32 v3, 1
+        ];
+        words.extend(mubuf(LOAD, 1, 0, 8));
+        words.extend(mubuf(LOAD, 2, 0, 12));
+        words.push(0xBF8C_3F70); // s_waitcnt vmcnt(0)
+        words.extend(mubuf(STORE, 1, 0, 16));
+        words.extend(mubuf(STORE, 2, 3, 16));
+        words.push(0xBF81_0000);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let srv = |offset: u32| UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: offset,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let out_uav = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 1,
+            slot: 1,
+        };
+        let layout = vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 1,
+                slot: 1,
+            },
+        ];
+        {
+            let used = vec![srv(0), srv(8), out_uav];
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: layout.clone(),
+                used: used.clone(),
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 3 << 1,
+                    threads: [1, 1, 1],
+                }),
+                code: code.clone(),
+            };
+            let p = victory_shader::ir::build(&native.code, false, native.vgprs).unwrap();
+            let st = victory_shader::structure::structure(&p).unwrap();
+            let res = victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = victory_shader::io::raise(&p, &native).unwrap();
+            let c = Container {
+                digest: [0; 16],
+                version: (1, 0),
+                parts: Vec::new(),
+            };
+            let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let pso = crate::pipeline::test_compute_pipeline(shader, used);
+
+            // Title buffers: two inputs and the output.
+            let make = |fill: u32| {
+                let mut r = null;
+                assert_eq!(
+                    create_committed(null, &PROPERTIES, 0, &buffer(256), 0, null.cast(), &RESOURCE_IIDS[0], &mut r),
+                    S_OK
+                );
+                let (data, _) = buffer_bytes(r).unwrap();
+                // SAFETY: 256 bytes.
+                unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), 64) }.fill(fill);
+                r
+            };
+            let (b, out) = (make(B), make(SENTINEL));
+            let backing = heap(3 * KIB_64);
+            let place = |offset, width| {
+                let mut r = null;
+                assert_eq!(create_placed(null, backing, offset, &buffer(width), 0,
+                    null.cast(), &RESOURCE_IIDS[0], &mut r), S_OK);
+                r
+            };
+            let parent = place(0, 2 * KIB_64);
+            let child = place(KIB_64, KIB_64);
+            let (parent_data, parent_width) = buffer_bytes(parent).unwrap();
+            let (child_data, _) = buffer_bytes(child).unwrap();
+            assert_eq!(child_data as usize - parent_data as usize, KIB_64 as usize);
+            // SAFETY: the child view begins in committed guest heap memory.
+            unsafe { child_data.cast::<u32>().write(A) };
+            let outer = crate::shadow::find(parent_data as u64, parent_width).unwrap();
+            let inner = crate::shadow::find(child_data as u64, 4).unwrap();
+            assert!(!std::sync::Arc::ptr_eq(&outer, &inner));
+            // The title's shader-visible heap, placed in its own memory.
+            let mut memory = vec![0u8; 16 * 32];
+            let address = memory.as_mut_ptr() as u64;
+            #[repr(C)]
+            struct Extended([u32; 4], [u64; 2]);
+            let ext = Extended([0, 16, 1, 1], [address, 16 * 32]);
+            let mut heap = null;
+            assert_eq!(
+                crate::descriptor::create_heap(
+                    null,
+                    std::ptr::from_ref(&ext).cast(),
+                    &PAGEABLE_IIDS[0],
+                    &mut heap
+                ),
+                S_OK
+            );
+            // Structured buffer SRVs, stride 4, 64 elements.
+            let desc: [u32; 10] = [0, 1, 0x1688, 0, 0, 0, 64, 4, 0, 0];
+            let mut placed = [0u32; 16];
+            placed[..10].copy_from_slice(&desc);
+            placed[4] = (KIB_64 / 4) as u32; // FirstElement within parent
+            placed[6] = 1;
+            placed[10] = parent_data as u64 as u32;
+            placed[11] = (parent_data as u64 >> 32) as u32;
+            let mut parent_words = [0u32; 14];
+            parent_words[0] = BUFFER;
+            parent_words[4] = parent_width as u32;
+            parent_words[6] = 1;
+            parent_words[7] = 1 << 16 | 1;
+            parent_words[9] = 1;
+            parent_words[11] = 1;
+            crate::descriptor::create_placed_srv(null, &parent_words, &placed, address);
+            crate::descriptor::create_srv(null, b, &desc, address + 32);
+            let uav: [u32; 10] = [0, 1, 0, 0, 64, 4, 0, 0, 0, 0];
+            crate::descriptor::create_uav(null, out, null, &uav, address + 4 * 32);
+
+            // Rewrite the same child bytes between ordinary submissions.
+            let mut got = [[0u32; 2]; 2];
+            for (round, read) in got.iter_mut().enumerate() {
+                if round == 1 {
+                    // SAFETY: this is the same committed guest word as in round one.
+                    unsafe { child_data.cast::<u32>().write(B2) };
+                }
+                let list = host.new_list().expect("new_list");
+                let mut state = crate::draw::State::default();
+                state.set_heaps(&[heap]);
+                state.set_pipeline(pso);
+                state.set_table(true, 0, address);
+                state.set_table(true, 1, address + 4 * 32);
+                state.dispatch(&list, 1, 1, 1);
+                list.close();
+                host.execute(&[&list]);
+                let (o, _) = buffer_bytes(out).unwrap();
+                // SAFETY: 256 bytes.
+                *read = unsafe { [o.cast::<u32>().read_volatile(), o.cast::<u32>().add(1).read_volatile()] };
+            }
+            eprintln!("nested parent SRV GPU words: {got:08x?}");
+            for r in [child, parent, backing, b, out, heap, pso] {
+                slot::<Release>(r, 0x10)(r);
+            }
+            assert_eq!(got, [[A, B], [B2, B]]);
+        }
+    }
+
     fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {
             dimension: BUFFER,
