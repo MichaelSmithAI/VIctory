@@ -979,7 +979,10 @@ mod tests {
 
     #[cfg(feature = "diagnostics")]
     #[test]
-    fn typeless_rgba8_uav_clears_through_the_remapped_view() {
+    fn typeless_rgba8_uav_clear_is_read_through_the_remapped_srv() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
         let Some(host) = host() else { return };
         let null = std::ptr::null();
         let props = D3D12_HEAP_PROPERTIES {
@@ -1008,26 +1011,52 @@ mod tests {
             0x4059,
             [0xbc, 0x79, 0x5b, 0x5c, 0x98, 4, 15, 0xad],
         );
-        let mut resource = null;
-        assert_eq!(
-            crate::resource::create_committed(
-                null,
-                (&raw const props).cast(),
-                0,
-                (&raw const desc).cast(),
-                0,
-                null.cast(),
-                &iid,
-                &mut resource,
-            ),
-            0
-        );
+        let make_texture = || {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const props).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut resource,
+                ),
+                0
+            );
+            resource
+        };
+        let resource = make_texture();
+        let destination = make_texture();
         let texture = crate::resource::host_resource(resource).unwrap();
+        let output = crate::resource::host_resource(destination).unwrap();
         let view = View::Unordered(resource as usize, 0, Some([27, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
         let mut format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
         assert!(fits(texture, Some(&mut format), true));
         assert_eq!(format, DXGI_FORMAT_R8G8B8A8_UNORM);
-        let visible = HostHeap::new(false, 1).unwrap();
+        let mut srv_format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        assert!(fits(texture, Some(&mut srv_format), false));
+        assert_eq!(srv_format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let mut srv_words = [0; 10];
+        srv_words[0] = DXGI_FORMAT_R8G8B8A8_TYPELESS.0 as u32;
+        srv_words[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        srv_words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        let mip_levels = (std::mem::offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, Anonymous)
+            + std::mem::offset_of!(D3D12_TEX2D_SRV, MipLevels)) / std::mem::size_of::<u32>();
+        srv_words[mip_levels] = 1;
+        let checked = srv_desc(&srv_words);
+        // SAFETY: the view dimension is Texture2D.
+        let checked = unsafe { checked.Anonymous.Texture2D };
+        assert_eq!((checked.MostDetailedMip, checked.MipLevels), (0, 1));
+        let srv = View::Shader(resource as usize, Some(srv_words));
+        let dst_uav = View::Unordered(
+            destination as usize,
+            0,
+            Some([27, 4, 0, 0, 0, 0, 0, 0, 0, 0]),
+        );
+        let visible = HostHeap::new(false, 3).unwrap();
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -1040,6 +1069,56 @@ mod tests {
         let cpu_handle = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
         assert_eq!(make(&view, cpu_handle), Some(Some(texture.clone())));
         visible.make_at(0, &view);
+        visible.make_at(1, &srv);
+        visible.make_at(2, &dst_uav);
+        let shader = r#"
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+[RootSignature("DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0))")]
+[numthreads(2, 2, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst[id.xy] = src.Load(int3(id.xy, 0)).zxyw;
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: source and output live through the call.
+        unsafe {
+            D3DCompile(
+                shader.as_ptr().cast(),
+                shader.len(),
+                s!("view"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob owns the shader and its embedded root signature.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
         let list = host.new_list().unwrap();
         crate::list::ensure_state(
             &list,
@@ -1057,9 +1136,35 @@ mod tests {
                 &[],
             );
         }
-        crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        crate::list::ensure_state(
+            &list,
+            resource,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32,
+        );
+        crate::list::ensure_state(
+            &list,
+            destination,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
+        );
+        // SAFETY: slots 1 and 2 contain the compatible source and destination views.
+        unsafe {
+            let base = visible.heap.GetGPUDescriptorHandleForHeapStart().ptr;
+            let handle = |index: u64| D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: base + index * u64::from(visible.step),
+            };
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, handle(1));
+            list.list.SetComputeRootDescriptorTable(1, handle(2));
+            list.list.Dispatch(1, 1, 1);
+        }
+        crate::list::ensure_state(
+            &list,
+            destination,
+            D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+        );
         let (readback, footprint) =
-            crate::capture::read_back(&host.device, &list.list, texture).unwrap();
+            crate::capture::read_back(&host.device, &list.list, output).unwrap();
         list.close();
         host.execute(&[&list]);
         let mut mapped = std::ptr::null_mut();
@@ -1072,7 +1177,7 @@ mod tests {
                     .add(footprint.Offset as usize + row * footprint.Footprint.RowPitch as usize);
                 assert_eq!(
                     std::slice::from_raw_parts(start, 8),
-                    &[0, 255, 64, 255, 0, 255, 64, 255]
+                    &[64, 0, 255, 255, 64, 0, 255, 255]
                 );
             }
             readback.Unmap(0, None);
@@ -1080,5 +1185,6 @@ mod tests {
         let release =
             crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(resource, 0x10);
         assert_eq!(release(resource), 0);
+        assert_eq!(release(destination), 0);
     }
 }
