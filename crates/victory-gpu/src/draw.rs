@@ -1323,8 +1323,27 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
+        // A shader emitted as one console wave per host group runs that many
+        // host groups per console group along x: the clamp writes each record
+        // so multiplied to a buffer of the list's, which is executed instead
+        // (the title's records keep their counts).
+        let waves = match kind {
+            DISPATCH => crate::pipeline::host_pipeline(self.pipeline as This)
+                .filter(|p| p.compute)
+                .map_or(1, group_waves),
+            _ => 1,
+        };
+        let scaled = if waves > 1 {
+            let Some(buffer) = list.rect_args(u64::from(max.max(1)) * 12) else {
+                why("no buffer for the scaled records");
+                return false;
+            };
+            Some(buffer)
+        } else {
+            None
+        };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| host_signature(kind, if scaled.is_some() { 12 } else { stride }))
             .flatten()
         else {
             why("no host signature");
@@ -1335,26 +1354,47 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        let bounded = match &scaled {
+            None => crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)),
+            Some(buffer) => {
+                // SAFETY: a live buffer.
+                let to = unsafe { buffer.GetGPUVirtualAddress() };
+                crate::indirect::clamp_scaled(list, args.gpu(arguments), (kind, stride, max), waves, Some(to))
+                    && {
+                        // SAFETY: an open list and a live buffer of the list's.
+                        unsafe {
+                            list.list.ResourceBarrier(&[crate::host::transition(
+                                buffer,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                            )]);
+                        }
+                        true
+                    }
+            }
+        };
+        if !bounded {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
+        // What runs: the title's records, or the scaled ones.
+        let (exec, exec_at) = match &scaled {
+            None => (&args.buffer, args.offset(arguments)),
+            Some(buffer) => (buffer, 0),
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                // shortcut: a shader emitted as one console wave per host
-                // group needs the records' x multiplied on the GPU; until
-                // the clamp does that, its indirect dispatches are dropped.
-                Some(p) if p.compute && group_waves(p) == 1 => self.bind(list, p, true),
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, exec);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1378,13 +1418,13 @@ impl State {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                args.offset(arguments),
+                exec,
+                exec_at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, exec);
         if crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.has_root_uavs())
         {
             emit_uav_barrier(list);
@@ -2015,6 +2055,125 @@ mod tests {
             crate::shadow::unregister(dst as usize, dst);
             eprintln!("interior root SRV range {remaining}: {value:#06x}");
         }
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        assert_eq!(release(pso), 0);
+    }
+
+    /// A wave64 program in groups of two console waves, which a host
+    /// without 64-lane waves runs as one host group per console wave
+    /// (`group_waves` 2): each lane writes lane 40 of its console wave (its
+    /// thread id) to a root UAV at 128 * group + thread. Run directly and
+    /// through `execute_indirect`, whose records the clamp writes with x
+    /// doubled to a buffer of the list's; the title's records keep theirs.
+    #[test]
+    fn indirect_dispatches_run_each_console_wave_as_a_host_group() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let target = host.target();
+        let words: [u32; 21] = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0301, // s_mov_b32 s5, s1
+            0xBE86_03C1, // s_mov_b32 s6, -1
+            0xBE87_03FF,
+            0x3101_4FAC, // s_mov_b32 s7, raw buffer format
+            0x9308_FF02,
+            128 * 4, // s_mul_i32 s8, s2 (group id x), 512
+            0xD760_0009,
+            0x0001_5100, // v_readlane_b32 s9, v0, 40
+            0x7E04_0209, // v_mov_b32 v2, s9
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0x4A06_0608, // v_add_nc_u32 v3, s8, v3
+            0xE070_1000,
+            0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+            0xBF81_0000, // s_endpgm
+            0, 0, 0, 0, 0, 0,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1 | 1 << 7, // two user SGPRs, then group id x
+                threads: [128, 1, 1],
+            }),
+            code: words[..15].iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = victory_shader::ir::build(&native.code, true, 8).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let res =
+            victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader =
+            victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, target).unwrap();
+        let waves = shader.group_waves;
+        if target.runs(64) {
+            assert_eq!(waves, 1, "a host with 64-lane waves runs the console group");
+        } else {
+            assert_eq!(waves, 2, "one host group per console wave");
+        }
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+
+        const GROUPS: u32 = 3;
+        // Title memory on the heap (not write-watched: no journal entries
+        // outlive the test).
+        let mut out = vec![0u32; (GROUPS * 128) as usize];
+        let mut args = Box::new([0u32; 4]);
+        let (out_at, args_at) = (out.as_mut_ptr() as u64, args.as_mut_ptr() as u64);
+        let out_len = (out.len() * 4) as u64;
+        crate::shadow::register(out_at as usize, out_at, out_len);
+        crate::shadow::register(args_at as usize, args_at, 16);
+        let want: Vec<u32> = (0..GROUPS * 128).map(|f| (f % 128 & !63) + 40).collect();
+        for indirect in [false, true] {
+            out.fill(0xEEEE_EEEE);
+            args[..3].copy_from_slice(&[GROUPS, 1, 1]);
+            let list = host.new_list().expect("new_list");
+            let mut state = State::default();
+            state.set_pipeline(pso);
+            state.set_view(true, 0, out_at);
+            if indirect {
+                assert!(state.execute_indirect(&list, (2, 12, 1), args_at, None));
+            } else {
+                state.dispatch(&list, GROUPS, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: our live buffer, written by the copy-back.
+            let got: Vec<u32> = (0..out.len())
+                .map(|i| unsafe { std::ptr::read_volatile(out.as_ptr().add(i)) })
+                .collect();
+            assert_eq!(got, want, "indirect {indirect}, {waves} host groups per console group");
+            // SAFETY: as above.
+            let record = unsafe { std::ptr::read_volatile(args.as_ptr().cast::<[u32; 3]>()) };
+            assert_eq!(record, [GROUPS, 1, 1], "the title's record keeps its count");
+            eprintln!("indirect {indirect}: {GROUPS} console groups of two waves exact ({waves} host groups each)");
+        }
+        crate::shadow::unregister(args_at as usize, args_at);
+        crate::shadow::unregister(out_at as usize, out_at);
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
         assert_eq!(release(pso), 0);
     }

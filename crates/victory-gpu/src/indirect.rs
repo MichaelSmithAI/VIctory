@@ -26,9 +26,13 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint waves; };
 RWByteAddressBuffer args : register(u0);
+// Dispatches of a shader emitted as one console wave per host group
+// (`waves` > 1): each clamped record again, x times `waves`, packed 12 bytes
+// apart. The title's record keeps its console group count.
+RWByteAddressBuffer scaled : register(u2);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
@@ -53,8 +57,17 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
-        cost = g.x * g.y * g.z * 64;
         args.Store3(at, g);
+        // Host groups: past 65,535 along x the scaled record runs empty
+        // (a direct dispatch is dropped there).
+        uint w = max(waves, 1u);
+        if (g.x > 65535u / w) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64 * w;
+        if (w > 1) {
+            scaled.Store3(id.x * 12, uint3(g.x * w, g.y, g.z));
+        }
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
@@ -67,6 +80,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (before >= BUDGET || before + cost > BUDGET) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
+        if (kind == 2 && waves > 1) {
+            scaled.Store(id.x * 12, 0);
+        }
     }
 }
 "#;
@@ -148,10 +164,20 @@ fn make() -> windows::core::Result<Clamp> {
 /// in another compute shader). Replaces the list's compute root signature
 /// and pipeline (callers bind theirs after). False if the clamp is not
 /// available.
-pub(crate) fn clamp_uav(
+pub(crate) fn clamp_uav(list: &HostList, gpu: u64, spec: (u32, u32, u32)) -> bool {
+    clamp_scaled(list, gpu, spec, 1, None)
+}
+
+/// As [`clamp_uav`]; for dispatches (`kind` 2) of a shader emitted as one
+/// console wave per host group (`waves` > 1), also writes each clamped
+/// record with x times `waves` to `scaled` (a host GPU address in unordered
+/// access state, 12 bytes per record), the records to execute.
+pub(crate) fn clamp_scaled(
     list: &HostList,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
+    waves: u32,
+    scaled: Option<u64>,
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
@@ -160,7 +186,8 @@ pub(crate) fn clamp_uav(
         return false;
     }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let waves = if scaled.is_some() { waves.max(1) } else { 1 };
+    let constants = [kind, stride, records, waves];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -171,6 +198,8 @@ pub(crate) fn clamp_uav(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        // Written only with `waves` > 1; else any valid address.
+        l.SetComputeRootUnorderedAccessView(3, scaled.unwrap_or(gpu));
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             format!("indirect argument clamp kind {kind}, {records} records, stride {stride}")
