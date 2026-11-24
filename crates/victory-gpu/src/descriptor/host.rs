@@ -70,7 +70,11 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// on top of every title slot, but takes these: the title's slots keep
+/// their room first. A heap the host caps (NVIDIA, 1,000,000) has
+/// [`DYNAMIC`] instead: in the world the title's tables need some 300k
+/// slots made afresh every few seconds, and 2^16 ran dry inside each
+/// submission, dropping most of its draws (#747).
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
@@ -112,7 +116,7 @@ impl HostHeap {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -956,6 +960,26 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A view heap the host caps (the title's slots and even the smaller
+    /// dynamic range past its limit) keeps the full dynamic range, which
+    /// the world's fresh tables need, and the title's slots below it.
+    #[test]
+    fn a_capped_view_heap_keeps_the_full_dynamic_range() {
+        let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS - 1000) else {
+            return; // no host GPU
+        };
+        // SAFETY: the heap is live.
+        let slots = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+        if slots != PORTABLE_VIEWS {
+            eprintln!("host took {slots} view slots: not capped here");
+            return;
+        }
+        assert_eq!(heap.dynamic, DYNAMIC);
+        assert_eq!(heap.count(), PORTABLE_VIEWS - DYNAMIC);
+        assert_eq!(heap.dynamic(DYNAMIC), Some(heap.count()));
+        assert_eq!(heap.dynamic(1), None);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
