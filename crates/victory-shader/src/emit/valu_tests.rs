@@ -81,7 +81,13 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_cs(&words)
+}
 
+/// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
+/// layout: 4 root constants in `s0..s3`, the address of a table holding a
+/// UAV in `s4`.
+fn lower_cs(words: &[u32]) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -186,7 +192,8 @@ fn run_cases(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
+                    (root, _) => super::host::guard(root, 1, 0)
+                        .unwrap_or_else(|| panic!("unexpected user data {:?}", (root, u.slot))),
                 };
             }
             let out = host
@@ -931,5 +938,38 @@ fn v_cmp_class_f16_matches_rdna2() {
             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
+    });
+}
+
+/// A data-computed index can select the allocated UAV or the reserved null slot.
+#[test]
+fn a_heap_index_selects_the_bound_view_or_its_reserved_guard() {
+    let words = [
+        s_mov_b32(5, 0x80),     // s5 = 0
+        sop2(0x1E, 6, 0, 0x85), // s_lshl_b32 s6, s0, 5: the index from data
+        // s_load_dwordx4 s[8:11], s[4:5], s6
+        s_load_dwordx4(8, 4)[0],
+        6 << 25,
+        vop1(0x001, 0, 0x87), // v_mov_b32 v0, 7
+        buffer_store_dword(0, 8, 0)[0],
+        buffer_store_dword(0, 8, 0)[1],
+        S_ENDPGM,
+    ];
+    let shader = lower_cs(&words);
+    // The guard is a user-data dword of its own, past the console's.
+    let guard: Vec<_> = shader
+        .user_data
+        .iter()
+        .filter(|u| u.root == RootType::ResourceHeap)
+        .collect();
+    assert_eq!(guard.len(), 1, "{:?}", shader.user_data);
+    assert_eq!(guard[0].index, 5, "after s0..s4");
+    let cases = [
+        [0, 0, 0, 0],           // heap index 0: the UAV
+        [1, 0, 0, 0],           // the guard slot itself
+    ];
+    run_cases(&shader, &cases, |label, i, k, got| {
+        let want = if i == 0 { 7 } else { 0 };
+        assert_eq!(got, want, "{label}: index {:#x}", k[0]);
     });
 }

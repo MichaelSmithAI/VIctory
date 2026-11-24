@@ -17,7 +17,8 @@ pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have `dynamic` more.
+    /// Slots mirroring the title's; view heaps have `dynamic` more, then
+    /// their guard slot ([`HostHeap::guard_slot`]).
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
     /// where the host takes them, else [`MIN_DYNAMIC`].
@@ -73,6 +74,10 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// A view heap's guard slot, past its dynamic ones and never in their pool
+/// (see [`HostHeap::guard_slot`]).
+const GUARD: u32 = 1;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -103,16 +108,17 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
+        } else if let Ok(heap) = make(count + DYNAMIC + GUARD) {
             (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
+            match make(count + MIN_DYNAMIC + GUARD) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+                Err(e) if count + MIN_DYNAMIC + GUARD > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    let count = PORTABLE_VIEWS - MIN_DYNAMIC - GUARD;
+                    (make(PORTABLE_VIEWS).ok()?, count, MIN_DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -120,6 +126,9 @@ impl HostHeap {
                 }
             }
         };
+        // Slots past the dynamic ones: a view heap's guard slot.
+        let guard = if sampler { 0 } else { GUARD };
+        let slots = count + extra + guard;
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -132,7 +141,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(slots) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -144,7 +153,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Mutex::new(vec![None; slots as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -152,7 +161,7 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, slots) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
@@ -261,6 +270,19 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The slot translated shaders read in place of a computed heap index
+    /// at or past it (a stale buffer can give any index, and one past the
+    /// heap hangs some GPUs): in a view heap its last slot, after the
+    /// dynamic ones, null from the start and never made; in a sampler heap
+    /// its last slot (any sampler reads safely).
+    pub(crate) fn guard_slot(&self) -> u32 {
+        if self.sampler {
+            self.count.saturating_sub(1)
+        } else {
+            self.count + self.dynamic
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -956,6 +978,42 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A view heap's guard slot is its last, past the dynamic pool, which
+    /// never hands it out.
+    #[test]
+    fn view_heap_guard_is_outside_the_dynamic_pool() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // SAFETY: the heap is live.
+        let slots = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+        assert_eq!(heap.guard_slot(), slots - 1);
+        assert_eq!(heap.dynamic(heap.dynamic), Some(heap.count()));
+        assert_eq!(heap.dynamic(1), None);
+        assert_eq!(heap.count() + heap.dynamic, heap.guard_slot());
+    }
+
+    /// A view heap the host caps (the title's slots and the dynamic ones
+    /// past its limit) keeps its guard slot inside it, past the dynamic
+    /// pool.
+    #[test]
+    fn a_capped_view_heap_keeps_its_guard_inside() {
+        let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS - 1000) else {
+            return; // no host GPU
+        };
+        // SAFETY: the heap is live.
+        let slots = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+        if slots != PORTABLE_VIEWS {
+            eprintln!("host took {slots} view slots: not capped here");
+            return;
+        }
+        assert_eq!(heap.dynamic, MIN_DYNAMIC);
+        assert_eq!(heap.count(), PORTABLE_VIEWS - MIN_DYNAMIC - GUARD);
+        assert_eq!(heap.guard_slot(), slots - 1);
+        assert_eq!(heap.dynamic(heap.dynamic), Some(heap.count()));
+        assert_eq!(heap.dynamic(1), None);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
