@@ -102,6 +102,14 @@ impl Heap {
         self.host.get()?.as_ref()
     }
 
+    /// Whether this handle names the start of a view slot.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn has_view_slot(&self, handle: u64) -> bool {
+        self.desc.kind == VIEWS_KIND
+            && self.index(handle).is_some()
+            && (handle - self.start).is_multiple_of(u64::from(increment(VIEWS_KIND).unwrap()))
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
