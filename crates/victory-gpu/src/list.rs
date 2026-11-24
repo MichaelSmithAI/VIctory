@@ -1000,10 +1000,16 @@ extern "system" fn set_predication(this: This, buffer: This, offset: u64, operat
         };
         #[cfg(feature = "diagnostics")]
         host.note_op(|| format!("set predication {buffer:?}+{offset:#x} {operation:?}"));
-        if let Some(resource) = crate::resource::host_resource(buffer) {
-            ensure_state(host, buffer, D3D12_RESOURCE_STATE_PREDICATION.0 as u32);
-            // SAFETY: an open list and a live buffer with an aligned predicate.
-            unsafe { host.list.SetPredication(Some(resource), offset, operation) };
+        let address = data as u64;
+        let written = host.written_shadow(data as usize, 8).and_then(|shadow| {
+            let offset = shadow.offset_for_range(address, 8)?;
+            offset.is_multiple_of(8).then_some((shadow, offset))
+        });
+        if let Some((shadow, offset)) = written {
+            // Use the dedicated state so the backend orders predicate reads after GPU writes.
+            host.buffer_state(&shadow.buffer, D3D12_RESOURCE_STATE_PREDICATION.0 as u32);
+            // SAFETY: the list holds the tracked buffer and its predicate is aligned.
+            unsafe { host.list.SetPredication(Some(&shadow.buffer), offset, operation) };
         } else if let Some(device) = crate::host::host()
             && let Some((upload, mapped)) = host.upload(device, 8)
         {
