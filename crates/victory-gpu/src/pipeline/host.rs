@@ -304,8 +304,10 @@ impl HostPipeline {
         use windows::Win32::Graphics::Direct3D::{
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
         };
-        matches!(topology, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST | D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
-            || self.stages.iter().all(|stage| stage.program != Program::Gs)
+        matches!(
+            topology,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST | D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+        ) || self.stages.iter().all(|stage| stage.program != Program::Gs)
     }
 
     /// A host pipeline for vertex (or mesh), optionally geometry, and pixel
@@ -739,6 +741,13 @@ mod geometry_tests {
 
     #[test]
     fn geometry_stage_draws_through_the_guest_state() {
+        // Guest triangle list and direct rectangles expanded to host triangles.
+        for topology in [4, 17] {
+            draw_and_check_target(topology);
+        }
+    }
+
+    fn draw_and_check_target(topology: u32) {
         let Some(host) = host() else { return };
         let source = r#"
 struct V { float4 pos : SV_Position; float4 color : COLOR; };
@@ -891,7 +900,7 @@ float4 ps(V input) : SV_Target { return input.color; }
         let rtv = host.rtv(&target, None);
         let mut state = crate::draw::State::default();
         state.set_pipeline(pipeline);
-        state.set_topology(&list, 4);
+        state.set_topology(&list, topology);
         crate::draw::viewports(
             &list,
             &[D3D12_VIEWPORT {
@@ -935,7 +944,10 @@ float4 ps(V input) : SV_Target { return input.color; }
             for y in 0..8 {
                 let row =
                     std::slice::from_raw_parts(texel.add(y * fp.Footprint.RowPitch as usize), 32);
-                assert!(row.chunks_exact(4).all(|rgba| rgba == [255, 0, 0, 255]));
+                assert!(
+                    row.chunks_exact(4).all(|rgba| rgba == [255, 0, 0, 255]),
+                    "topology {topology}, row {y}"
+                );
             }
             readback.Unmap(0, None);
         }
