@@ -421,6 +421,27 @@ impl State {
         }
     }
 
+    /// The bytes root view `slot` holds from its start, as [`root_view`]
+    /// binds it. Shaders check their accesses against it: a root view has
+    /// no bounds on the host, and an access past the memory it maps is a
+    /// GPU page fault, which some hosts stall on until the driver resets
+    /// the device. 0 for a root view the title did not set.
+    fn root_view_bytes(&self, compute: bool, slot: u8, kind: RootView) -> u32 {
+        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        if address == 0 {
+            return 0;
+        }
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            return 0;
+        };
+        if kind != RootView::Cbv && !shadow.gpu(address).is_multiple_of(4) {
+            return 0;
+        }
+        root_len(shadow.left(address), kind) as u32
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -564,6 +585,16 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        None if u.root == RootType::Descriptor => {
+                            let kind = if stage.root_uavs.iter().any(|r| r.0 == u.slot) {
+                                RootView::Uav
+                            } else if stage.root_srvs.iter().any(|r| r.0 == u.slot) {
+                                RootView::Srv
+                            } else {
+                                RootView::Cbv
+                            };
+                            self.root_view_bytes(compute, u.slot, kind)
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -1639,6 +1670,138 @@ mod tests {
         };
         let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
         (shader, used)
+    }
+
+    fn build_structured_root_uav_cs() -> (victory_shader::emit::HostShader, Vec<UsedResource>) {
+        let s_mov_b32 =
+            |dst: u8, src: u8| 0xBE80_0000 | u32::from(dst) << 16 | 0x03 << 8 | u32::from(src);
+        let vop1 = |op: u16, dst: u8, src: u16| {
+            0x7e00_0000 | u32::from(dst) << 17 | u32::from(op) << 9 | u32::from(src)
+        };
+        const S_ENDPGM: u32 = 0xbf81_0000;
+        const STRIDE: u32 = 8;
+        // MUBUF `op vdata, vaddr(index), s[srsrc:srsrc+3], 0 idxen offset:off`.
+        let mubuf_idxen = |op: u32, vdata: u8, vaddr: u8, srsrc: u8, off: u16| -> [u32; 2] {
+            [
+                0x38 << 26 | op << 18 | 1 << 13 | (off as u32 & 0xFFF),
+                0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+            ]
+        };
+        const STORE: u32 = 0x1C; // buffer_store_dword
+        const LOAD: u32 = 0x0C; // buffer_load_dword
+        const ATOMIC_ADD: u32 = 0x32; // buffer_atomic_add (no return)
+
+        let mut words = vec![
+            // A buffer descriptor around the root UAV s[0:1] in s[8:11].
+            s_mov_b32(8, 0),
+            s_mov_b32(9, 1),
+            s_mov_b32(10, 0xC1), // -1 records
+            s_mov_b32(11, 0xFF),
+            0x3101_4FAC,
+            vop1(0x001, 1, 128 + 2), // v1 = 2 (index)
+            vop1(0x001, 2, 0xFF),    // v2 = 0xABCD
+            0x0000_ABCD,
+            vop1(0x001, 3, 128 + 5), // v3 = 5
+            vop1(0x001, 5, 128),     // v5 = 0 (index)
+        ];
+        // Element 2: dword 5 = 0xABCD, dword 4 += 5; then element 0, dword 0 =
+        // what element 2 byte 4 holds.
+        words.extend(mubuf_idxen(STORE, 2, 1, 8, 4));
+        words.extend(mubuf_idxen(ATOMIC_ADD, 3, 1, 8, 0));
+        words.extend(mubuf_idxen(LOAD, 4, 1, 8, 4));
+        words.extend(mubuf_idxen(STORE, 4, 5, 8, 0));
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: STRIDE,
+                dwords: 2,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = victory_shader::ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        (shader, native.used)
+    }
+
+    #[test]
+    fn dispatch_binds_the_remaining_bytes_of_an_interior_structured_root_uav() {
+        const OFFSET: usize = 8;
+        const PREFIX: [u32; 2] = [0x1234_5678, 0x1020_3040];
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 adapter; interior root UAV control skipped");
+            return;
+        };
+        let (shader, used) = build_structured_root_uav_cs();
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+        for (bytes, want) in [
+            (24, [0xABCD, 0, 0, 0, 5, 0xABCD]),
+            (20, [0, 0, 0, 0, 5, 0]),
+            (16, [0; 6]),
+        ] {
+            // Both guest memory and the host's rounded backing cover the
+            // addresses read by the fixture. Register only the logical range.
+            let mut guest = Box::new([0u32; 8]);
+            guest[..2].copy_from_slice(&PREFIX);
+            let base = guest.as_mut_ptr() as u64;
+            let root = base + OFFSET as u64;
+            crate::shadow::register(base as usize, base, OFFSET as u64 + bytes);
+            let shadow = crate::shadow::find(base, 1).unwrap();
+            let padding: Vec<_> = ((OFFSET + bytes as usize)..32)
+                .step_by(4)
+                .map(|at| (at, shadow.read_backing_u32(at)))
+                .collect();
+
+            let list = host.new_list().expect("new_list");
+            let mut state = State::default();
+            state.set_pipeline(pso);
+            state.set_view(true, 0, root);
+            assert_eq!(state.root_view_bytes(true, 0, RootView::Uav), bytes as u32);
+            state.dispatch(&list, 1, 1, 1);
+            list.close();
+            host.execute(&[&list]);
+
+            assert_eq!(guest[..2], PREFIX, "interior root overwrote prefix");
+            assert_eq!(guest[2..], want, "guest after registered extent {bytes}");
+            for (at, word) in padding {
+                assert_eq!(shadow.read_backing_u32(at), word, "write into physical padding at {at}");
+            }
+            eprintln!("State::dispatch extent {bytes}: {guest:08x?}");
+            crate::shadow::unregister(base as usize, base);
+        }
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        assert_eq!(release(pso), 0);
+        eprintln!("registered interior structured root UAV readback completed");
     }
 
     #[test]

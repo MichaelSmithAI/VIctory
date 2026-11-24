@@ -106,6 +106,15 @@ impl Shadow {
         unsafe { self.data.add(offset).cast::<u32>().read_unaligned() }
     }
 
+    #[cfg(test)]
+    pub(crate) fn read_backing_u32(&self, offset: usize) -> u32 {
+        // SAFETY: the live backing buffer can exceed the registered extent.
+        let width = unsafe { self.buffer.GetDesc() }.Width;
+        assert!((offset + 4) as u64 <= width);
+        // SAFETY: the read fits the physical mapping.
+        unsafe { self.data.add(offset).cast::<u32>().read_unaligned() }
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
