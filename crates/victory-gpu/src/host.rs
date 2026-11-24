@@ -498,6 +498,8 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Texture copies/resolves recorded on this list, committed once it runs.
+    host_writes: Vec<crate::texture::PendingHostWrite>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -696,6 +698,11 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        for list in runs {
+            for write in &list.deferred().host_writes {
+                crate::texture::commit_host_write(write);
+            }
+        }
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -1165,6 +1172,11 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// Commits a recorded texture copy or resolve once the list has run.
+    pub(crate) fn defer_host_write(&self, write: crate::texture::PendingHostWrite) {
+        self.deferred().host_writes.push(write);
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
