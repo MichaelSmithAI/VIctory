@@ -421,6 +421,27 @@ impl State {
         }
     }
 
+    /// The bytes root view `slot` holds from its start, as [`root_view`]
+    /// binds it. Shaders check their accesses against it: a root view has
+    /// no bounds on the host, and an access past the memory it maps is a
+    /// GPU page fault, which some hosts stall on until the driver resets
+    /// the device. 0 for a root view the title did not set.
+    fn root_view_bytes(&self, compute: bool, slot: u8, kind: RootView) -> u32 {
+        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        if address == 0 {
+            return 0;
+        }
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            return 0;
+        };
+        if kind != RootView::Cbv && !shadow.gpu(address).is_multiple_of(4) {
+            return 0;
+        }
+        root_len(shadow.left(address), kind) as u32
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -564,6 +585,16 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        None if u.root == RootType::Descriptor => {
+                            let kind = if stage.root_uavs.iter().any(|r| r.0 == u.slot) {
+                                RootView::Uav
+                            } else if stage.root_srvs.iter().any(|r| r.0 == u.slot) {
+                                RootView::Srv
+                            } else {
+                                RootView::Cbv
+                            };
+                            self.root_view_bytes(compute, u.slot, kind)
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
