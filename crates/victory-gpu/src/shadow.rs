@@ -404,6 +404,16 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_inner(address, len, true)
+}
+
+/// A buffer explicitly registered by the title. Inferred addresses from
+/// root constants must resolve to a GPU resource rather than loose memory.
+pub(crate) fn find_registered(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_inner(address, len, false)
+}
+
+fn find_inner(address: u64, len: u64, allow_loose: bool) -> Option<Arc<Shadow>> {
     if address < 0x10000 {
         return None;
     }
@@ -417,7 +427,11 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end);
+        return if allow_loose {
+            loose(address, end)
+        } else {
+            None
+        };
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {

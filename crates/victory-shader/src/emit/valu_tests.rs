@@ -147,6 +147,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_constant_srvs: lowered.root_constant_srvs,
         root_uavs: lowered.root_uavs,
     };
 
@@ -938,6 +939,7 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_constant_srvs: Vec::new(),
             root_uavs: slots.to_vec(),
         }
     };

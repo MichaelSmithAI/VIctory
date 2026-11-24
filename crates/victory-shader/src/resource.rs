@@ -99,6 +99,8 @@ pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
+    /// Inferred raw root SRV reads, with slot and exclusive byte end.
+    pub constant_srv_reads: Vec<(Site, (u8, u32))>,
     pub descriptors: Vec<Descriptor>,
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
@@ -176,7 +178,11 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let (address, constant_srv) =
+                        t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    if let Some(binding) = constant_srv {
+                        out.constant_srv_reads.push((site, binding));
+                    }
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -660,7 +666,7 @@ impl<'a> Tracer<'a> {
         base: &Operand,
         offset: i32,
         soffset: &Operand,
-    ) -> Result<Address, &'static str> {
+    ) -> Result<(Address, Option<(u8, u32)>), &'static str> {
         let Operand::Scalar { code, .. } = *base else {
             return Err("an address not in SGPRs");
         };
@@ -668,15 +674,63 @@ impl<'a> Tracer<'a> {
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
         };
-        let mut extra = self.sum(
-            self.term(inst, soffset)
-                .ok_or("an unknown offset operand")?,
-        );
+        let term = self
+            .term(inst, soffset)
+            .ok_or("an unknown offset operand")?;
+        if term == Term::Const(0)
+            && let Some((address, extent)) = self.constant_root_read(inst, lo, hi, offset)
+        {
+            return Ok((address, Some(extent)));
+        }
+        let mut extra = self.sum(term);
         if extra.base.is_some() {
             return Err("an offset from a root parameter");
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
-        self.address(lo, hi, extra)
+        self.address(lo, hi, extra).map(|address| (address, None))
+    }
+
+    /// A direct, fixed-range scalar read through the two words of a root
+    /// constants slot. Other access forms keep the original address rules.
+    fn constant_root_read(
+        &self,
+        inst: &Inst,
+        lo: Term,
+        hi: Term,
+        offset: i32,
+    ) -> Option<(Address, (u8, u32))> {
+        if self.stage != HwStage::Cs || !inst.name().starts_with("s_load_dword") {
+            return None;
+        }
+        let (Term::Value(lo), Term::Value(hi)) = (lo, hi) else {
+            return None;
+        };
+        let (param, word) = self.param_of(self.inputs[lo.0 as usize]?)?;
+        let root = self.layout[param];
+        if root.root != RootType::Constants
+            || root.sgprs != 2
+            || word != 0
+            || self.param_of(self.inputs[hi.0 as usize]?) != Some((param, 1))
+        {
+            return None;
+        }
+        let Fields::Smem {
+            data: Some(Operand::Scalar { dwords, .. }),
+            ..
+        } = inst.fields
+        else {
+            return None;
+        };
+        let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
+        let end = offset.checked_add(u32::from(dwords) * 4)?;
+        Some((
+            Address {
+                param,
+                offset,
+                dynamic: None,
+            },
+            (root.slot, end),
+        ))
     }
 
     fn descriptor(&self, inst: &Inst, op: &Operand) -> Result<Source, &'static str> {
