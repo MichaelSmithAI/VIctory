@@ -62,6 +62,15 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether an adapter is hardware. A machine without a GPU (a CI runner)
+/// can list the Microsoft Basic Render Driver, which is WARP, as an
+/// ordinary adapter without the software flag: its ids, or its name, tell.
+fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
+    let basic_render_driver = d.VendorId == 0x1414 && d.DeviceId == 0x8c
+        || description(&d.Description) == "Microsoft Basic Render Driver";
+    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !basic_render_driver
+}
+
 /// The hardware adapters, in DXGI's order: each one's description.
 pub fn adapters() -> Result<Vec<String>, String> {
     // SAFETY: plain DXGI calls.
@@ -71,7 +80,7 @@ pub fn adapters() -> Result<Vec<String>, String> {
         let mut i = 0;
         while let Ok(a) = factory.EnumAdapters1(i) {
             let d = a.GetDesc1().map_err(err)?;
-            if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            if hardware(&d) {
                 out.push(description(&d.Description));
             }
             i += 1;
@@ -110,9 +119,7 @@ impl Host {
                     .EnumAdapters1(i)
                     .map_err(|_| format!("no adapter named {name:?}"))?;
                 let d = a.GetDesc1().map_err(err)?;
-                if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
-                    && description(&d.Description).to_lowercase().contains(&want)
-                {
+                if hardware(&d) && description(&d.Description).to_lowercase().contains(&want) {
                     break a;
                 }
                 i += 1;
