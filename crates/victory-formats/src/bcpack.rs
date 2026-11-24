@@ -262,7 +262,15 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     let stride = widths.len() * per;
     let mut records = vec![0u8; blocks * stride];
     let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+    match lanes::<false>(tables, widths, per, blocks, |_| next.next(), &mut records) {
+        // Retry BC7 framing only when ordinary lane decoding cannot produce
+        // the required symbols. Streams already accepted keep their decoding.
+        Err(_) if bc == 7 => {
+            let mut next = src.iter().copied();
+            lanes::<true>(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+        }
+        result => result?,
+    }
     let records = records.chunks_exact(stride);
     let out = dst.chunks_exact_mut(block);
     let t = tables;
@@ -286,6 +294,7 @@ struct Lane {
     phase: u8,
     long: bool,
     reset: bool,
+    implied_zeros: u8,
     model: u8,
     need: bool,
     latch: Option<u8>,
@@ -298,7 +307,7 @@ struct Lane {
 impl Lane {
     /// One step: take the latched byte (header, length or payload) and
     /// decode at most one symbol.
-    fn step(&mut self, t: &Tables) -> Result<(), Error> {
+    fn step<const RESTORE_SUFFIX: bool>(&mut self, t: &Tables) -> Result<(), Error> {
         if self.phase != 3 {
             let Some(b) = self.latch.take() else {
                 return Ok(());
@@ -310,6 +319,7 @@ impl Lane {
                     let group = self.width - (b >> 6);
                     self.model = group * 16 + (b & 15);
                     self.reset = b & 0x10 != 0;
+                    self.implied_zeros = 0;
                     self.long = b & 0x20 != 0;
                     self.left = 0;
                     self.phase = 1;
@@ -335,6 +345,15 @@ impl Lane {
         {
             self.left = self.left.wrapping_sub(1);
             x = x << 8 | u32::from(b);
+        }
+        // The public mode-6 packets omit up to two trailing zero bytes from
+        // reset fragments. Only restore them after the declared payload ends:
+        // a byte missing within that payload is still a truncated stream.
+        if RESTORE_SUFFIX && self.reset && self.left == 0 {
+            while x != 0 && x < LOW && self.implied_zeros < 2 {
+                x <<= 8;
+                self.implied_zeros += 1;
+            }
         }
         self.need = self.left != 0 && self.latch.is_none();
         if x > LOW {
@@ -392,7 +411,7 @@ impl Lane {
 // shortcut: one lane step at a time (BC1 roughly 30-60 MB/s, BC7 15-20 MB/s
 // on one core); if texture streaming needs more, run the schedule only to
 // split the input per lane and decode the lanes apart.
-fn lanes(
+fn lanes<const RESTORE_SUFFIX: bool>(
     t: &Tables,
     widths: &[u8],
     per: usize,
@@ -415,7 +434,7 @@ fn lanes(
             let bit = 1 << j;
             let before = taken;
             if !lane.stalled {
-                lane.step(t)?;
+                lane.step::<RESTORE_SUFFIX>(t)?;
             }
             let waiting = lane.out.is_some() && done & bit != 0;
             if lane.need && !waiting && taken < ROUND_BYTES {
@@ -1210,6 +1229,16 @@ mod tests {
     /// that has finished still asks: a filler fragment (two payload bytes)
     /// brings its state to 2^24 with a byte latched, which parks it for good.
     fn stream(t: &Tables, widths: &[u8], per: usize, records: &[Vec<u8>]) -> Vec<u8> {
+        stream_with_fragments::<false>(t, widths, per, records, |_, _| {})
+    }
+
+    fn stream_with_fragments<const RESTORE_SUFFIX: bool>(
+        t: &Tables,
+        widths: &[u8],
+        per: usize,
+        records: &[Vec<u8>],
+        mut modify: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Vec<u8> {
         let stride = widths.len() * per;
         let mut queues: Vec<std::collections::VecDeque<u8>> = (0..widths.len())
             .map(|j| {
@@ -1218,6 +1247,7 @@ mod tests {
                     .flat_map(|r| r[j * per..j * per + per].to_vec())
                     .collect();
                 let mut bytes = fragment(widths[j], &syms);
+                modify(j, &mut bytes);
                 bytes.extend([0, 1, 0, 0]);
                 bytes.into()
             })
@@ -1231,7 +1261,7 @@ mod tests {
             out.push(b);
             Some(b)
         };
-        lanes(t, widths, per, records.len(), fetch, &mut check).unwrap();
+        lanes::<RESTORE_SUFFIX>(t, widths, per, records.len(), fetch, &mut check).unwrap();
         assert_eq!(check, records.concat());
         out
     }
@@ -1280,7 +1310,7 @@ mod tests {
         let src = stream(&t, &BC4_LANES, 1, &records);
         let mut got = vec![0u8; records.len() * 12];
         let mut next = src.iter().copied();
-        lanes(&t, &BC4_LANES, 1, records.len(), |_| next.next(), &mut got).unwrap();
+        lanes::<false>(&t, &BC4_LANES, 1, records.len(), |_| next.next(), &mut got).unwrap();
         assert_eq!(got, records.concat());
     }
 
@@ -1318,6 +1348,39 @@ mod tests {
         w.put(1, 1);
         w.put(1, 1);
         assert_eq!(dst, w.v.to_le_bytes());
+    }
+
+    #[test]
+    fn bc7_reset_fragments_restore_omitted_zeros() {
+        let t = Tables::parse(&tables()).unwrap();
+        let widths = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        let mut record = vec![0; 32];
+        record[4] = zigzag(0x55);
+        record[5] = zigzag(-1);
+        let records = [record];
+        let full = stream(&t, &widths, 2, &records);
+        // Encode the same records with lane 2 reset and its final two zero
+        // renormalization bytes omitted from the declared payload.
+        let shortened = stream_with_fragments::<true>(&t, &widths, 2, &records, |j, bytes| {
+            if j == 2 {
+                assert_eq!(bytes.pop(), Some(0));
+                assert_eq!(bytes.pop(), Some(0));
+                bytes[0] |= 0x10;
+                bytes[1] -= 2;
+            }
+        });
+        let mut ordinary = shortened.iter().copied();
+        assert!(lanes::<false>(&t, &widths, 2, 1, |_| ordinary.next(), &mut [0; 32]).is_err());
+
+        let mut expected = [0; 16];
+        decode(7, &full, &mut expected, &t).unwrap();
+        let mut output = [0xcd; 16];
+        decode(7, &shortened, &mut output, &t).unwrap();
+        assert_eq!(output, expected);
+
+        output.fill(0xcd);
+        assert!(decode(7, &shortened[..shortened.len() / 2], &mut output, &t).is_err());
+        assert_eq!(output, [0xcd; 16]);
     }
 
     #[test]
