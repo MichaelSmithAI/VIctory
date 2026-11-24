@@ -712,6 +712,7 @@ mod tests {
             Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
         };
         let Some(host) = crate::host::host() else {
+            eprintln!("Skipping structured SRV readback because D3D12 is unavailable");
             return;
         };
         let words = [
@@ -872,6 +873,7 @@ mod tests {
         create_placed_srv(null, &resource, &srv, heap.start);
         state.set_constants(true, 0, &[24], 0);
         state.dispatch(&list, 1, 1, 1);
+        assert_eq!(view(heap.start), Some(View::Placed(false, resource, srv)));
         // A legal raw input retains the stride-four behavior of the original PR.
         let mut raw = srv;
         raw[0] = 39; // R32_TYPELESS
@@ -892,6 +894,7 @@ mod tests {
         // SAFETY: dword 7 is within the registered output range.
         assert_eq!(unsafe { (dst as *const u32).add(7).read() }, 102);
         assert_eq!(view(heap.start), Some(View::Placed(false, resource, raw)));
+        eprintln!("Structured SRV generation and raw SRV readbacks passed");
         drop(state);
         release(heap_obj);
         slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
