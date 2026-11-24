@@ -74,6 +74,17 @@
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
+//! * **Geometry shaders** (added 2026-11-24; [`emit`] only, [`translate`]
+//!   still picks the VS): the console's legacy ES-GS pair (rings in LDS).
+//!   The ES half of a vertex container ([`HwStage::Es`]) becomes a vertex
+//!   shader whose outputs are the container's `OSG1` (ESGS parameter n must
+//!   be row n). The GS half ([`HwStage::Gs`], `gs_6_6`) reads input row n
+//!   of each vertex where the console reads ESGS dwords 4n..4n+3, keeps
+//!   what it writes to the GSVS ring in a per-thread array, and at each
+//!   emit stores the outputs the embedded copy shader would export from it
+//!   (its `OSG1`, so the title's pixel shaders link) then `EmitStream`;
+//!   triangles in, triangle strips out, one stream, the record's maximum
+//!   vertex count. User data and descriptors as above.
 
 mod bitcode;
 mod container;
