@@ -1373,10 +1373,53 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
         if !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                if !write(at, n) && touch_watched(at) {
+                    write(at, n);
+                }
             });
         }
     });
+}
+
+/// Makes the committed, writable title page holding `at` writable by
+/// another write after one was refused; false where it is not such a page.
+///
+/// Wine (11.x) keeps a write-watched page write-protected after
+/// `GetWriteWatch(RESET)` until a store faults on it, and does the current
+/// process's `WriteProcessMemory` in its server with `process_vm_writev`,
+/// which takes no fault: the write is refused with `ERROR_PARTIAL_COPY`
+/// and what shaders wrote never reaches title memory (Windows writes it).
+/// Storing the byte at `at` back unchanged takes that fault, which records
+/// the write (as the kernel's write would on Windows) and lifts the
+/// protection. Pages not committed, not writable or guard pages keep the
+/// refusal.
+fn touch_watched(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: a query; `info` is ours.
+    let got = unsafe {
+        VirtualQuery(
+            at as *const _,
+            &mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    let writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if got == 0
+        || info.State != MEM_COMMIT
+        || info.Protect & writable == 0
+        || info.Protect & PAGE_GUARD != 0
+    {
+        return false;
+    }
+    let p = at as *mut u8;
+    // SAFETY: a committed writable page of title memory; the byte is stored
+    // back unchanged, inside the range the caller then writes whole.
+    unsafe { p.write_volatile(p.read_volatile()) };
+    true
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -1977,6 +2020,78 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod copyback {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualProtect,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// What shaders wrote reaches title memory the GPU side watches, after
+    /// the watch was reset (as each submission's sweep resets it). Wine
+    /// refuses `WriteProcessMemory` there (see `touch_watched`); 3 of the 4
+    /// pages are written, from mid-page to mid-page, and the bytes around
+    /// them keep theirs.
+    #[test]
+    fn copies_reach_watched_title_pages_after_a_reset() {
+        const SIZE: usize = 64 << 10;
+        // SAFETY: a fresh allocation of ours.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!p.is_null());
+        // SAFETY: inside the allocation.
+        unsafe { p.write_bytes(0x11, SIZE) };
+        let (mut pages, mut count, mut granularity) = ([std::ptr::null_mut(); 16], 16usize, 0u32);
+        // SAFETY: room for `count` addresses.
+        let reset = unsafe {
+            GetWriteWatch(1, p.cast(), SIZE, pages.as_mut_ptr(), &mut count, &mut granularity)
+        };
+        assert_eq!(reset, 0);
+        let (from, len) = (0x800, 3 * 4096);
+        let gpu = vec![0xA5u8; len];
+        super::write_mapped(p.wrapping_add(from), gpu.as_ptr(), len);
+        // SAFETY: inside the allocation.
+        let all = unsafe { std::slice::from_raw_parts(p, SIZE) };
+        assert!(all[from..from + len].iter().all(|&b| b == 0xA5), "the GPU's bytes landed");
+        assert!(all[..from].iter().all(|&b| b == 0x11));
+        assert!(all[from + len..].iter().all(|&b| b == 0x11));
+        // SAFETY: ours.
+        assert_ne!(unsafe { VirtualFree(p.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A page the title made read-only keeps its bytes: the copy is still
+    /// refused there, and the writable page next to it is written.
+    #[test]
+    fn read_only_title_pages_keep_refusing_copies() {
+        const SIZE: usize = 2 * 4096;
+        // SAFETY: a fresh allocation of ours.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as *mut u8;
+        assert!(!p.is_null());
+        // SAFETY: inside the allocation.
+        unsafe { p.write_bytes(0x11, SIZE) };
+        let mut old = 0;
+        // SAFETY: the first page of ours.
+        assert_ne!(unsafe { VirtualProtect(p.cast(), 4096, PAGE_READONLY, &mut old) }, 0);
+        let gpu = vec![0xA5u8; SIZE];
+        super::write_mapped(p, gpu.as_ptr(), SIZE);
+        // SAFETY: inside the allocation, readable.
+        let all = unsafe { std::slice::from_raw_parts(p, SIZE) };
+        assert!(all[..4096].iter().all(|&b| b == 0x11), "the read-only page kept its bytes");
+        assert!(all[4096..].iter().all(|&b| b == 0xA5), "the writable page was written");
+        // SAFETY: ours.
+        assert_ne!(unsafe { VirtualFree(p.cast(), 0, MEM_RELEASE) }, 0);
     }
 }
 
