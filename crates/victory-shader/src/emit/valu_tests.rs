@@ -6,7 +6,7 @@
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
 use super::host::{Dispatch, Host, Root, View};
-use super::{HostShader, lower, validator};
+use super::{HostShader, container, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -69,6 +69,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    lower_test_shader(&valu_program(body), &[])
+}
+
+fn valu_program(body: &[u32]) -> NativeProgram {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -83,7 +87,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
@@ -120,15 +124,21 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             threads: [1, 1, 1],
         }),
         code,
-    };
+    }
+}
+
+fn lower_test_shader(native: &NativeProgram, parts: &[(crate::FourCC, &[u8])]) -> HostShader {
+    let bytes = crate::dxbc::build(parts);
+    let container = crate::Container::parse(&bytes).unwrap();
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        psv: container.part(crate::FourCC::PSV0).map(|part| part.data),
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -172,6 +182,15 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_with_views(shader, cases, &[View::RawUav(1)], check);
+}
+
+fn run_with_views(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    views: &[View<'_>],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -199,7 +218,7 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views,
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -210,6 +229,70 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn data_only_structured_srv_reads_its_bound_record_count() {
+    // The second heap slot contains an SRV. Its only use is a read of dword 2.
+    let mut load = s_load_dwordx4(12, 4);
+    load[1] |= 32;
+    let mut body = load.to_vec();
+    body.push(vop1(0x001, 0, sgpr(14)));
+    let mut native = valu_program(&body);
+    native.used.push(UsedResource {
+        kind: ResourceType::Srv,
+        table_offset_dwords: 8,
+        lower_bound: 109,
+        stride: 16,
+        ..native.used[0]
+    });
+    use container::{Binding, Psv};
+    let binding = Binding {
+        kind: 5,
+        space: 1,
+        register: 109,
+        dxil_kind: 12,
+    };
+    let declarations = |bindings: &[Binding]| {
+        container::psv(&Psv {
+            stage: 5,
+            flag: false,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            bindings,
+            threads: [1, 1, 1],
+            wave_size: None,
+        })
+    };
+    let psv = declarations(&[binding]);
+    let alias = Binding {
+        kind: 3,
+        space: 2,
+        dxil_kind: 10,
+        ..binding
+    };
+    assert!(!super::declares_structured_buffer(
+        &declarations(&[binding, alias]),
+        109,
+        false
+    ));
+    assert!(!super::declares_structured_buffer(&psv, 108, false));
+    let shader = lower_test_shader(&native, &[(crate::FourCC::PSV0, &psv)]);
+    for n in [3, 11] {
+        let words = vec![0; n * 4];
+        let views = [
+            View::RawUav(1),
+            View::Buffer {
+                data: &words,
+                stride: super::host::Stride::Structured(16),
+            },
+        ];
+        run_with_views(&shader, &[[0; 4]], &views, |device, _, _, out| {
+            assert_eq!(out, n as u32, "{device} structured buffer record count");
+        });
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {
