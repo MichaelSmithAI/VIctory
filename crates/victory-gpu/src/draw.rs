@@ -79,9 +79,27 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    #[cfg(feature = "diagnostics")]
+    frame_depth_views: Option<(u64, Vec<DepthViewBinding>)>,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Debug, PartialEq, Eq)]
+struct DepthViewBinding {
+    kind: ResourceType,
+    view_format: Option<u32>,
+    resource: Option<usize>,
+    address: u64,
+    width: u64,
+    height: u32,
+    format: u32,
+    table: (u8, u32),
+    host_heap: usize,
+    host_slot: u32,
+    backed: Option<bool>,
 }
 
 impl Drop for State {
@@ -410,7 +428,19 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> Result<(), &'static str> {
+    fn bind(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+    ) -> Result<(), &'static str> {
+        #[cfg(feature = "diagnostics")]
+        {
+            let frame = crate::queue::presented() + 1;
+            self.frame_depth_views = (tracing::enabled!(tracing::Level::DEBUG)
+                && crate::capture::listed(frame))
+            .then(|| (frame, Vec::new()));
+        }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -667,7 +697,36 @@ impl State {
                 ),
             }
         };
-        let text = self.op_text(kind.to_owned(), compute);
+        use std::fmt::Write;
+        let mut text = self.op_text(kind.to_owned(), compute);
+        if ran
+            && let Some((bound_frame, views)) = &self.frame_depth_views
+            && *bound_frame == frame
+        {
+            for u in views {
+                let binding = match u.backed {
+                    Some(true) => "backed",
+                    Some(false) => "null",
+                    None => "unknown",
+                };
+                let resource = u
+                    .resource
+                    .map_or_else(|| "placed".into(), |r| format!("{r:#x}"));
+                let view = u.view_format.map_or_else(|| "default".into(), |f| f.to_string());
+                let _ = write!(
+                    text,
+                    " | depth-table-view kind={:?} resource={resource} address={:#x} size={}x{} f{} view={view} root=s{}+{} heap={:#x} slot={} binding={binding}",
+                    u.kind, u.address, u.width, u.height, u.format, u.table.0, u.table.1,
+                    u.host_heap, u.host_slot,
+                );
+            }
+        }
+        if ran
+            && !compute
+            && let Some((address, _)) = crate::resource::texture_memory(self.depth as This)
+        {
+            let _ = write!(text, " | depth-address={:#x}", address as u64);
+        }
         tracing::debug!(
             "frame {frame} op: pipeline {:#x} topology {} targets {targets:?} depth {:#x} -> {outcome} || {text}",
             self.pipeline,
@@ -747,7 +806,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -759,7 +818,86 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            #[cfg(feature = "diagnostics")]
+            self.note_depth_view(host, index, u, &view);
             readable(list, u, &view);
+        }
+    }
+
+    /// Snapshot an explicitly traced table slot once its host view exists.
+    /// This identifies the binding, without claiming the dispatch wrote it.
+    #[cfg(feature = "diagnostics")]
+    fn note_depth_view(
+        &mut self,
+        host: &crate::descriptor::host::HostHeap,
+        index: u32,
+        used: &UsedResource,
+        view: &View,
+    ) {
+        let Some((_, out)) = self.frame_depth_views.as_mut() else {
+            return;
+        };
+        let allow_depth = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32;
+        let (resource, address, width, height, format, view_format) = match (used.kind, view) {
+            (ResourceType::Uav, View::Unordered(resource, _, view))
+            | (ResourceType::Srv, View::Shader(resource, view)) => {
+                let this = *resource as This;
+                let Some(texture) = crate::resource::host_resource(this) else {
+                    return;
+                };
+                let Some((address, _)) = crate::resource::texture_memory(this) else {
+                    return;
+                };
+                // SAFETY: host_resource returned the live texture behind this view.
+                let desc = unsafe { texture.GetDesc() };
+                if desc.Flags.0 as u32 & allow_depth == 0 {
+                    return;
+                }
+                (
+                    Some(*resource),
+                    address as u64,
+                    desc.Width,
+                    desc.Height,
+                    desc.Format.0 as u32,
+                    view.as_ref().map(|d| d[0]),
+                )
+            }
+            (ResourceType::Uav, View::Placed(true, r, d))
+            | (ResourceType::Srv, View::Placed(false, r, d)) if r[0] != 1 => {
+                let format = crate::resource::pc_format(r[8]);
+                // A placed depth/stencil texture can be exposed through an
+                // untyped descriptor whose flags omit ALLOW_DEPTH_STENCIL.
+                let depth_family = matches!(crate::resource::family(format), 19 | 44);
+                let plane_alias = matches!(format, 41 | 62); // R32_FLOAT and R8_UINT
+                if r[12] & allow_depth == 0 && !depth_family && !plane_alias {
+                    return;
+                }
+                (
+                    None,
+                    u64::from(d[10]) | u64::from(d[11]) << 32,
+                    u64::from(r[4]) | u64::from(r[5]) << 32,
+                    r[6],
+                    format,
+                    Some(d[0]),
+                )
+            }
+            _ => return,
+        };
+        let entry = DepthViewBinding {
+            kind: used.kind,
+            view_format,
+            resource,
+            address,
+            width,
+            height,
+            format,
+            table: (used.slot, used.table_offset_dwords),
+            host_heap: host.heap.as_raw() as usize,
+            host_slot: index,
+            backed: host.slot_has_resource(index),
+        };
+        if !out.contains(&entry) {
+            out.push(entry);
         }
     }
 
@@ -846,6 +984,8 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
+                        #[cfg(feature = "diagnostics")]
+                        self.note_depth_view(host, first + u.table_offset_dwords / 8, u, &view);
                         readable(list, u, &view);
                     }
                 }
@@ -880,6 +1020,10 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
+                        #[cfg(feature = "diagnostics")]
+                        for u in entries.iter().filter(|u| u.table_offset_dwords / 8 == k) {
+                            self.note_depth_view(host, index, u, &view);
+                        }
                         if let Some(u) = used {
                             readable(list, u, &view);
                         }
@@ -1314,14 +1458,17 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        Some(View::Unordered(r, ..)) => format!("uav resource {r:#x} {:?}", texture(*r as This)),
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],
@@ -1370,4 +1517,154 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod depth_trace_tests {
+    use super::*;
+    use crate::{descriptor::host::HostHeap, object, resource};
+
+    #[test]
+    fn depth_trace_identifies_ordinary_and_placed_bindings() {
+        let Some(heap) = HostHeap::new(false, 6) else {
+            eprintln!("no D3D12 view heap; depth attribution test skipped");
+            return;
+        };
+        let mut state = State::default();
+        state.frame_depth_views = Some((1, Vec::new()));
+        let used = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let iid = object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let null = std::ptr::null();
+        let mut resources = Vec::new();
+        for (slot, format, host_format, view_format, backed) in
+            [(0, 20, 19, 41, false), (1, 55, 53, 56, true)]
+        {
+            let memory = resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
+            let address = memory.address();
+            let desc = [3u32, 0, 0, 0, 8, 0, 8, 0x10001, format, 1, 0, 0, 6, 0];
+            let mut depth = null;
+            assert_eq!(
+                resource::create_at_address(
+                    null,
+                    address,
+                    desc.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut depth
+                ),
+                crate::object::S_OK,
+            );
+            let view = View::Unordered(
+                depth as usize,
+                0,
+                Some([view_format, 4, 0, 0, 0, 0, 0, 0, 0, 0]),
+            );
+            heap.make_at(slot, &view);
+            state.note_depth_view(&heap, slot, &used, &view);
+            let snapshot = &state.frame_depth_views.as_ref().unwrap().1[slot as usize];
+            assert_eq!(
+                snapshot,
+                &DepthViewBinding {
+                    kind: ResourceType::Uav,
+                    view_format: Some(view_format),
+                    resource: Some(depth as usize),
+                    address,
+                    width: 8,
+                    height: 8,
+                    format: host_format,
+                    table: (0, 0),
+                    host_heap: heap.heap.as_raw() as usize,
+                    host_slot: slot,
+                    backed: Some(backed),
+                }
+            );
+            resources.push((memory, depth));
+        }
+        let address = resources[0].0.address();
+        // A raw plane alias omits the depth flag and has a different
+        // resource format, but names the same title address as the DSV.
+        let mut placed_view = [0; 16];
+        placed_view[0] = 41;
+        placed_view[1] = 4;
+        placed_view[10] = address as u32;
+        placed_view[11] = (address >> 32) as u32;
+        for (slot, format, flags) in [(2, 19, 6), (3, 41, 4)] {
+            let placed = View::Placed(
+                true,
+                [3, 0, 0, 0, 8, 0, 8, 0x10001, format, 1, 0, 0, flags, 0],
+                placed_view,
+            );
+            heap.make_at(slot, &placed);
+            state.note_depth_view(&heap, slot, &used, &placed);
+            let view = &state.frame_depth_views.as_ref().unwrap().1[slot as usize];
+            assert_eq!(
+                view,
+                &DepthViewBinding {
+                    kind: ResourceType::Uav,
+                    view_format: Some(41),
+                    resource: None,
+                    address,
+                    width: 8,
+                    height: 8,
+                    format,
+                    table: (0, 0),
+                    host_heap: heap.heap.as_raw() as usize,
+                    host_slot: slot,
+                    backed: Some(false),
+                }
+            );
+            assert_eq!(
+                resource::texture_memory(resources[0].1).unwrap().0 as u64,
+                view.address
+            );
+        }
+        let depth = resources[0].1;
+        let srv = UsedResource {
+            kind: ResourceType::Srv,
+            ..used
+        };
+        for (slot, format, backed) in [(4, 21, true), (5, 41, false)] {
+            let view = View::Shader(depth as usize, Some([format, 4, 5768, 0, 0, 1, 0, 0, 0, 0]));
+            heap.make_at(slot, &view);
+            state.note_depth_view(&heap, slot, &srv, &view);
+            let snapshot = &state.frame_depth_views.as_ref().unwrap().1[slot as usize];
+            assert_eq!(
+                snapshot,
+                &DepthViewBinding {
+                    kind: ResourceType::Srv,
+                    view_format: Some(format),
+                    resource: Some(depth as usize),
+                    address,
+                    width: 8,
+                    height: 8,
+                    format: 19,
+                    table: (0, 0),
+                    host_heap: heap.heap.as_raw() as usize,
+                    host_slot: slot,
+                    backed: Some(backed),
+                }
+            );
+        }
+        for (_memory, depth) in resources {
+            object::release(depth);
+        }
+        eprintln!(
+            "depth attribution checked ordinary null and backed SRVs/UAVs and a same-address placed null UAV"
+        );
+    }
 }
