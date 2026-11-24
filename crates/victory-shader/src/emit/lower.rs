@@ -2851,20 +2851,31 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if let Some(binding) = kind.filter(|u| u.kind == ResourceType::Srv) {
+            let stride = self.scalar_structured_stride(src, binding);
+            let props = stride.map_or((11, 0), |stride| (12, stride));
+            let h = self.handle(site, src, false, props)?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let (index, element_offset) = if let Some(stride) = stride {
+                    let stride = self.s.m.i32(stride);
+                    (
+                        self.s.m.bin(c, Bin::UDiv, a, stride),
+                        self.s.m.bin(c, Bin::URem, a, stride),
+                    )
+                } else {
+                    (a, self.s.m.undef(self.s.t.i32))
+                };
+                let al = self.s.m.i32(4);
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, index, element_offset, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
@@ -2993,6 +3004,12 @@ impl<'a> Lower<'a> {
                     return Err("a constant buffer's descriptor read as data");
                 }
                 (props, None)
+            }
+            Some(Fields::Smem { .. }) if un.starts_with("s_buffer_load_dword") => {
+                let stride = used
+                    .and_then(|binding| self.scalar_structured_stride(&src, binding))
+                    .ok_or("a scalar memory read as data")?;
+                ((12, stride), None)
             }
             None => {
                 // The shader may only inspect NUM_RECORDS. Use an exact
@@ -3282,6 +3299,26 @@ impl<'a> Lower<'a> {
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
+    fn scalar_structured_stride(&self, src: &Source, binding: &UsedResource) -> Option<u32> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let address = self.scalar.get(load)?;
+        let byte = address.offset.checked_add(4 * u32::from(*first))?;
+        let stride = binding.stride;
+        (binding.kind == ResourceType::Srv
+            && binding.dwords == 4
+            && address.dynamic.is_none()
+            && !self.x.res.waterfall.loads.contains(load)
+            && binding.table_offset_dwords.checked_mul(4) == Some(byte)
+            && (4..=2048).contains(&stride)
+            && stride.is_multiple_of(4)
+            && self.x.psv.is_some_and(|part| {
+                super::declares_structured_buffer(part, binding.lower_bound, false)
+            }))
+        .then_some(stride)
+    }
+
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src

@@ -295,6 +295,56 @@ fn data_only_structured_srv_reads_its_bound_record_count() {
     }
 }
 
+#[test]
+fn scalar_buffer_shape_comes_from_the_declared_view() {
+    use container::{Binding, Psv};
+    use super::host::Stride;
+
+    let words: Vec<u32> = (80..92).collect();
+    for (kind, dxil_kind, stride, add_count, expected) in [
+        (4, 11, Stride::Raw, false, 85),
+        (5, 12, Stride::Structured(16), true, 88),
+    ] {
+        let mut load = s_load_dwordx4(12, 4);
+        load[1] |= 32;
+        let mut body = load.to_vec();
+        // s_buffer_load_dword s16, s[12:15], 20
+        body.extend([0x3d << 26 | 8 << 18 | 16 << 6 | 6, 125 << 25 | 20]);
+        if add_count {
+            body.push(0x8010_0e10); // s_add_u32 s16, s16, s14
+        }
+        body.push(vop1(0x001, 0, sgpr(16)));
+        let mut native = valu_program(&body);
+        native.used.push(UsedResource {
+            kind: ResourceType::Srv,
+            table_offset_dwords: 8,
+            lower_bound: 109,
+            stride: 16,
+            ..native.used[0]
+        });
+        let psv = container::psv(&Psv {
+            stage: 5,
+            flag: false,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            bindings: &[Binding { kind, space: 1, register: 109, dxil_kind }],
+            threads: [1, 1, 1],
+            wave_size: None,
+        });
+        let shader = lower_test_shader(&native, &[(crate::FourCC::PSV0, &psv)]);
+        let views = [
+            View::RawUav(1),
+            View::Buffer { data: &words, stride },
+        ];
+        run_with_views(&shader, &[[0; 4]], &views, |device, _, _, out| {
+            eprintln!("{device}: PSV kind {kind} returned {out}");
+            assert_eq!(out, expected, "{device} PSV kind {kind}");
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
