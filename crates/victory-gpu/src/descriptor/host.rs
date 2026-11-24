@@ -36,11 +36,11 @@ pub(crate) struct HostHeap {
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
-/// device-removed reports: a shader indexing a heap past its end faults.
+/// comparison with the fault address in device-removed reports.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
 
 /// For device-removed reports: where host GPU address `va` lies against
-/// the host descriptor heaps.
+/// the host descriptor heaps. A slot is meaningful only inside a heap.
 pub(crate) fn near_heaps(va: u64) -> String {
     let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let mut text = String::new();
@@ -51,9 +51,9 @@ pub(crate) fn near_heaps(va: u64) -> String {
         } else if va < start + bytes {
             format!("inside, slot {}", (va - start) / step)
         } else {
-            format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
+            format!("{:#x} past its end", va - start - bytes)
         };
-        text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
+        text.push_str(&format!("; fault VA relative to {kind} heap {start:#x}+{bytes:#x}: {place}"));
     }
     text
 }
