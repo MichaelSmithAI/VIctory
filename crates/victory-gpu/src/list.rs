@@ -762,7 +762,7 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
-/// Clear a resource-backed texture with a matching bound GPU UAV and CPU UAV.
+/// Clear a resource-backed UAV with a matching bound GPU UAV and CPU UAV.
 #[cfg(windows)]
 fn clear_uav(
     this: This,
@@ -779,7 +779,7 @@ fn clear_uav(
         // SAFETY: the title passes count rectangles in the host's layout.
         unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
     };
-    with_state(this, |list, state| state.clear_texture_uav(list, gpu, cpu, resource, value, rects));
+    with_state(this, |list, state| state.clear_uav(list, gpu, cpu, resource, value, rects));
 }
 
 extern "system" fn clear_uav_uint(

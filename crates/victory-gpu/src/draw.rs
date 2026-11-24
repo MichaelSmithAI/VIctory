@@ -439,8 +439,8 @@ impl State {
         }
     }
 
-    /// Records a clear of a resource-backed texture UAV in the bound heap.
-    pub(crate) fn clear_texture_uav(
+    /// Records a clear of a resource-backed texture or typed buffer UAV.
+    pub(crate) fn clear_uav(
         &mut self,
         list: &HostList,
         gpu: u64,
@@ -457,37 +457,52 @@ impl State {
         if heap.index(gpu).is_none() {
             return;
         }
-        let (Some(View::Unordered(cpu_resource, _, words)), Some(View::Unordered(gpu_resource, _, _))) =
-            (crate::descriptor::view(cpu), crate::descriptor::view(gpu))
-        else {
+        let Some(view @ View::Unordered(backing, counter, words)) = crate::descriptor::view(cpu) else {
             return;
         };
-        if cpu_resource != resource as usize || gpu_resource != cpu_resource {
+        if backing != resource as usize || crate::descriptor::view(gpu) != Some(view) {
             return;
         }
-        let (Some(texture), Some(native_heap)) =
-            (crate::resource::host_resource(resource), heap.host())
-        else {
+        let Some(native_heap) = heap.host() else { return };
+        let host_texture = crate::resource::host_resource(resource);
+        let buffer = if host_texture.is_none() && counter == 0 {
+            words.as_ref()
+                .and_then(|words| crate::descriptor::host::buffer_clear_view(resource, words))
+        } else {
+            None
+        };
+        let (native_resource, pair) = if let Some(view) = &buffer {
+            let resource = &view.shadow.buffer;
+            (resource, native_heap.clear_uav_pair(list, resource, Some(&view.desc)))
+        } else if let Some(texture) = host_texture {
+            (texture, native_heap.clear_texture_uav(list, texture, words.as_ref()))
+        } else {
             return;
         };
-        let Some((slot, gpu, cpu)) = native_heap.clear_texture_uav(list, texture, words.as_ref())
-        else {
-            return;
-        };
+        let Some((slot, gpu, cpu)) = pair else { return };
         self.dynamic.push((heap_id, slot, 1));
         self.bind_heaps(list);
-        crate::list::ensure_state(list, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
-        // SAFETY: matched views, a live texture in UAV state, and the
-        // shader-visible descriptor's heap is bound on this list.
+        if let Some(view) = &buffer {
+            view.shadow.refresh(list, view.address, view.len);
+            view.shadow.gpu_writes(list, view.address, view.len);
+            list.buffer_state(native_resource, crate::host::BUFFER_WRITE);
+            buffer_clear_barrier(list, native_resource);
+        } else {
+            crate::list::ensure_state(list, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+        }
+        // SAFETY: matching UAVs of a live resource in UAV state.
         unsafe {
             match value {
                 UavClear::Uint(values) => {
-                    list.list.ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, rects);
+                    list.list.ClearUnorderedAccessViewUint(gpu, cpu, native_resource, &values, rects);
                 }
                 UavClear::Float(values) => {
-                    list.list.ClearUnorderedAccessViewFloat(gpu, cpu, texture, &values, rects);
+                    list.list.ClearUnorderedAccessViewFloat(gpu, cpu, native_resource, &values, rects);
                 }
             }
+        }
+        if buffer.is_some() {
+            buffer_clear_barrier(list, native_resource);
         }
     }
 
@@ -1157,6 +1172,21 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
     Some(signature)
+}
+
+fn buffer_clear_barrier(list: &HostList, buffer: &ID3D12Resource) {
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed buffer that the barrier never releases.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
+            }),
+        },
+    };
+    // SAFETY: a live buffer held in the open list's state tracker.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data

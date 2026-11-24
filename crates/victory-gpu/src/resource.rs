@@ -1366,6 +1366,90 @@ mod tests {
         visible_nodes: 0,
     };
 
+    #[cfg(windows)]
+    #[test]
+    fn resource_backed_buffer_uav_clears_update_only_the_view() {
+        let host = crate::host::host().expect("a host GPU");
+        let null = std::ptr::null();
+        const SENTINEL: u32 = 0x7a91234d;
+        let mut buffers = [null; 2];
+        for resource in &mut buffers {
+            let mut desc = buffer(256);
+            desc.flags = 4;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], resource),
+                S_OK
+            );
+            let (data, _) = buffer_bytes(*resource).unwrap();
+            // SAFETY: the committed allocation contains 64 aligned dwords.
+            unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), 64) }.fill(SENTINEL);
+        }
+
+        // The guest's CPU and shader-visible handles hold the same view.
+        #[repr(C)]
+        struct Extended([u32; 4], [u64; 2]);
+        let mut memory = [0u64; 32];
+        let base = memory.as_mut_ptr() as u64;
+        let mut heaps = [null; 2];
+        for (i, flags) in [0, 1].into_iter().enumerate() {
+            let extension = Extended([0, 4, flags, 1], [base + i as u64 * 128, 128]);
+            assert_eq!(
+                crate::descriptor::create_heap(null, std::ptr::from_ref(&extension).cast(), &PAGEABLE_IIDS[0], &mut heaps[i]),
+                S_OK
+            );
+        }
+        for (i, (resource, format)) in buffers.into_iter().zip([42, 41]).enumerate() {
+            // Clear elements 3..8 and later overwrite just elements 5..7.
+            for (j, (first, count)) in [(3, 5), (5, 2)].into_iter().enumerate() {
+                let words = [format, 1, first, 0, count, 0, 0, 0, 0, 0];
+                let slot = (i * 2 + j) as u64 * 32;
+                crate::descriptor::create_uav(null, resource, null, &words, base + slot);
+                crate::descriptor::create_uav(null, resource, null, &words, base + 128 + slot);
+            }
+        }
+
+        let allocator_iid = guid(
+            0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(list, 0x100)(list, 1, &heaps[1]);
+        type Clear<T> = extern "system" fn(This, u64, u64, This, *const [T; 4], u32, *const c_void);
+        let clear_uint = slot::<Clear<u32>>(list, 0x1a8);
+        clear_uint(list, base + 128, base, buffers[0], &[17; 4], 0, null.cast());
+        clear_uint(list, base + 160, base + 32, buffers[0], &[31; 4], 0, null.cast());
+        let clear_float = slot::<Clear<f32>>(list, 0x1b0);
+        clear_float(list, base + 192, base + 64, buffers[1], &[1.25; 4], 0, null.cast());
+        clear_float(list, base + 224, base + 96, buffers[1], &[-2.5; 4], 0, null.cast());
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        host.execute(&[crate::list::host_list(list).unwrap()]);
+        slot::<Release>(list, 0x10)(list);
+        slot::<Release>(allocator, 0x10)(allocator);
+
+        for (index, (resource, (first, second))) in buffers.into_iter()
+            .zip([(17, 31), (1.25f32.to_bits(), (-2.5f32).to_bits())]).enumerate()
+        {
+            let mut expected = [SENTINEL; 64];
+            expected[3..8].fill(first);
+            expected[5..7].fill(second);
+            let (data, _) = buffer_bytes(resource).unwrap();
+            // SAFETY: the completed list no longer writes the live allocation.
+            let actual = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 64) };
+            eprintln!("clear fixture {index} words: {:?}", &actual[..9]);
+            assert_eq!(actual, expected);
+            slot::<Release>(resource, 0x10)(resource);
+        }
+        for heap in heaps {
+            slot::<Release>(heap, 0x10)(heap);
+        }
+    }
+
     fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {
             dimension: BUFFER,
