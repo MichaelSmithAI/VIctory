@@ -211,6 +211,31 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    #[cfg(test)]
+    pub(crate) fn lod_coordinate_masks(&self) -> Vec<u8> {
+        self.insts
+            .iter()
+            .filter_map(|inst| match &inst.op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == "dx.op.calculateLOD.f32" => {
+                    Some(
+                        args[3..6]
+                            .iter()
+                            .enumerate()
+                            .fold(0, |mask, (i, &value)| match value {
+                                V::Const(id)
+                                    if matches!(self.consts[id as usize].1, Const::Undef) =>
+                                {
+                                    mask
+                                }
+                                _ => mask | 1 << i,
+                            }),
+                    )
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

@@ -5865,7 +5865,10 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // A LOD query depends on spatial coordinates only, even for
+            // array views. DXIL requires unused coordinates to stay undef.
+            let address_coords = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(address_coords) {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
@@ -7417,5 +7420,88 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn image_lod_queries_only_emit_spatial_coordinates() {
+        for (dim, spatial) in [(1, 2), (4, 1), (5, 2)] {
+            let mut words = vec![
+                0xBE82_0309,
+                0xBE89_0380,
+                0xBE83_0380,
+                0xF408_0204,
+                0xFA00_0000,
+                0xF40C_0001,
+                0xFA00_0000,
+            ];
+            for (i, value) in [0.125f32, 0.375, 1.0].into_iter().enumerate() {
+                words.extend([0x7e00_02ff | (((i as u32) + 4) << 17), value.to_bits()]);
+            }
+            words.extend([
+                0xF180_0318 & !0x38 | (dim << 3),
+                0x0040_0004,
+                0xF800_0803,
+                0x0000_0100,
+                S_ENDPGM,
+            ]);
+            let root = |user_data, slot| crate::RootParam {
+                root: crate::RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data,
+                slot,
+            };
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 12,
+                layout: vec![root(8, 0), root(9, 1)],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, 12).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let parts = Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![super::SigElement {
+                    name: "SV_Target".into(),
+                    index: 0,
+                    kind: 16,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 15,
+                    half: false,
+                }],
+                prims: vec![],
+                mesh_stride: 0,
+            };
+            let bad = std::collections::HashMap::new();
+            let mut lowerer = super::Lower::new(&parts, &bad);
+            for i in 0..parts.p.blocks[0].insts.len() {
+                assert!(lowerer.inst(0, i).is_ok());
+            }
+            assert_eq!(
+                lowerer.s.m.lod_coordinate_masks(),
+                vec![(1 << spatial) - 1; 2],
+                "texture dimension {dim}",
+            );
+        }
     }
 }
