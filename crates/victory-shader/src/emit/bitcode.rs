@@ -646,6 +646,46 @@ impl Module {
         actual & declared
     }
 
+    fn fold_empty_latches(&self, post: &[usize], live: &[bool]) -> Vec<Option<(usize, usize)>> {
+        let mut pos = vec![u64::MAX; self.blocks.len()];
+        for (n, &b) in post.iter().enumerate() {
+            pos[b] = n as u64;
+        }
+        // An empty latch (only a branch back to its loop header) is folded
+        // into its one predecessor, so the exiting block is the latch as in
+        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in post {
+            let (succs, len) = succs_of(self.blocks[b].term);
+            for &s in &succs[..len] {
+                preds[s].push(b);
+            }
+        }
+        let mut fold = vec![None; self.blocks.len()];
+        for &b in post {
+            let blk = &self.blocks[b];
+            let empty = blk.phis.iter().chain(&blk.body).all(|&i| !live[i as usize]);
+            if let (Some(Term::Br(h)), true, [p]) = (blk.term, empty, &preds[b][..])
+                && pos[h] < pos[b]
+                && pos[*p] < pos[b]
+                && fold[*p].is_none()
+                && fold[h].is_none()
+            {
+                let (ps, plen) = succs_of(self.blocks[*p].term);
+                // Both successors can be empty latches. Keep one if folding
+                // it would give the header two incoming values from the
+                // same predecessor.
+                let already_reaches_header = ps[..plen]
+                    .iter()
+                    .any(|&s| s == h || fold[s].is_some_and(|(_, target)| target == h));
+                if !already_reaches_header {
+                    fold[b] = Some((*p, h));
+                }
+            }
+        }
+        fold
+    }
+
     /// The module as bitcode.
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
@@ -815,36 +855,7 @@ impl Module {
         }
         w.exit();
 
-        let mut pos = vec![u64::MAX; self.blocks.len()];
-        for (n, &b) in post.iter().enumerate() {
-            pos[b] = n as u64;
-        }
-        // An empty latch (only a branch back to its loop header) is folded
-        // into its one predecessor, so the exiting block is the latch as in
-        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
-        let mut preds = vec![Vec::new(); self.blocks.len()];
-        for &b in &post {
-            let (succs, len) = succs_of(self.blocks[b].term);
-            for &s in &succs[..len] {
-                preds[s].push(b);
-            }
-        }
-        let mut fold = vec![None; self.blocks.len()];
-        for &b in &post {
-            let blk = &self.blocks[b];
-            let empty = blk.phis.iter().chain(&blk.body).all(|&i| !live[i as usize]);
-            if let (Some(Term::Br(h)), true, [p]) = (blk.term, empty, &preds[b][..])
-                && pos[h] < pos[b]
-                && pos[*p] < pos[b]
-                && fold[*p].is_none()
-                && fold[h].is_none()
-            {
-                let (ps, plen) = succs_of(self.blocks[*p].term);
-                if !ps[..plen].contains(&h) {
-                    fold[b] = Some((*p, h));
-                }
-            }
-        }
+        let fold = self.fold_empty_latches(&post, &live);
         let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in layout.iter().enumerate() {
@@ -1155,6 +1166,43 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dce_preserves_distinct_phi_backedges() {
+        let mut m = Module::default();
+        let entry = m.new_block();
+        let header = m.new_block();
+        let choose = m.new_block();
+        let left = m.new_block();
+        let right = m.new_block();
+        let exit = m.new_block();
+        let i32t = m.int(32);
+        let zero = m.i32(0);
+        let one = m.i32(1);
+        let two = m.i32(2);
+        let three = m.i32(3);
+        m.terminate(entry, Term::Br(header));
+        let state = m.phi(header, i32t);
+        let complete = m.cmp(header, pred::EQ, state, two);
+        m.terminate(header, Term::CondBr(complete, exit, choose));
+        let first_iteration = m.cmp(choose, pred::EQ, state, zero);
+        m.terminate(choose, Term::CondBr(first_iteration, left, right));
+        m.bin(left, Bin::Add, one, three);
+        m.terminate(left, Term::Br(header));
+        m.bin(right, Bin::Add, two, three);
+        m.terminate(right, Term::Br(header));
+        m.terminate(exit, Term::Ret);
+        m.set_phi(state, vec![(zero, entry), (one, left), (two, right)]);
+
+        let (post, seen) = m.reachable_rpo();
+        let folds = m.fold_empty_latches(&post, &m.live_in(&post, &seen));
+        let incoming = [left, right].map(|b| folds[b].map_or(b, |(p, _)| p));
+        assert_ne!(incoming[0], incoming[1], "the header's values differ");
+        assert!(
+            incoming.contains(&choose),
+            "one backedge can still be folded"
+        );
+    }
 
     #[test]
     fn vbr_and_blocks() {
