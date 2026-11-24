@@ -779,6 +779,40 @@ fn lds_written_and_read_in_different_masked_blocks() {
 }
 
 #[test]
+fn cross_row_permutation_stays_in_each_half() {
+    let body = [
+        0xbe94_03ff, 0x5312_e4b0, // s_mov_b32 s20, 0x5312e4b0
+        0xbe95_03ff, 0x98fc_6ad7, // s_mov_b32 s21, 0x98fc6ad7
+        0xd778_0002, 0x0054_2900, // v_permlanex16_b32 v2, v0, s20, s21
+        0xd760_0009, 0x0201_5100, // v_readlane_b32 s9, v0, 40
+        0x4a04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    let host = Host::new(false).expect("SM 6.6 hardware");
+    let target = host.target();
+    let selector = 0x98fc_6ad7_5312_e4b0u64;
+    for (body, extra) in [(&body[..6], 0), (&body[..], 40)] {
+        let p = program(body, 64);
+        let cs = emit_for(&p, target).unwrap();
+        let split = !target.runs(64);
+        assert_eq!(wave_size(&cs.dxil), Some(if split { 32 } else { 64 }));
+        if let Some(dir) = std::env::var_os("PERMLANE_DXIL_DIR") {
+            std::fs::write(std::path::Path::new(&dir).join(format!("permlane-{extra}.dxil")), &cs.dxil)
+                .unwrap();
+        }
+        if std::env::var_os("PERMLANE_EMIT_ONLY").is_some() {
+            continue;
+        }
+        let out = run(&host, &p, 2).unwrap();
+        let want: Vec<_> = (0..2).flat_map(|_| (0..64u32).map(|t| {
+            let pick = ((selector >> (4 * (t & 15))) & 15) as u32;
+            extra + ((t ^ 16) & !15) + pick
+        })).collect();
+        assert_eq!(out, want);
+        eprintln!("Permutation readback: {} exact words (split={split}, add={extra})", out.len());
+    }
+}
+
+#[test]
 fn backward_permute_wraps_within_each_half() {
     let body = [0x3406_0082, 0xDACC_0004, 0x0200_0003];
     console_flow_case("backward permute", &body, 64, |lane| {
