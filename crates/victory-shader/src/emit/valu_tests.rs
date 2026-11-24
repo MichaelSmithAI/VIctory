@@ -300,18 +300,22 @@ fn scalar_buffer_shape_comes_from_the_declared_view() {
     use container::{Binding, Psv};
     use super::host::Stride;
 
-    let words: Vec<u32> = (80..92).collect();
-    for (kind, dxil_kind, stride, add_count, expected) in [
-        (4, 11, Stride::Raw, false, 85),
-        (5, 12, Stride::Structured(16), true, 88),
+    let words: Vec<u32> = (1000..1060).collect();
+    for (kind, dxil_kind, stride, use_record_count, expected) in [
+        (4, 11, Stride::Raw, false, 1005),
+        (5, 12, Stride::Structured(80), true, 1041),
     ] {
         let mut load = s_load_dwordx4(12, 4);
         load[1] |= 32;
         let mut body = load.to_vec();
-        // s_buffer_load_dword s16, s[12:15], 20
-        body.extend([0x3d << 26 | 8 << 18 | 16 << 6 | 6, 125 << 25 | 20]);
-        if add_count {
-            body.push(0x8010_0e10); // s_add_u32 s16, s16, s14
+        if use_record_count {
+            body.push(0x8091_810e); // s_sub_u32 s17, s14, 1
+            body.extend([0x9311_ff11, 80]); // s_mul_i32 s17, s17, 80
+            // s_buffer_load_dword s16, s[12:15], s17 offset:4
+            body.extend([0xf420_0406, 0x2200_0004]);
+        } else {
+            // s_buffer_load_dword s16, s[12:15], 20
+            body.extend([0xf420_0406, 125 << 25 | 20]);
         }
         body.push(vop1(0x001, 0, sgpr(16)));
         let mut native = valu_program(&body);
@@ -319,7 +323,7 @@ fn scalar_buffer_shape_comes_from_the_declared_view() {
             kind: ResourceType::Srv,
             table_offset_dwords: 8,
             lower_bound: 109,
-            stride: 16,
+            stride: 80,
             ..native.used[0]
         });
         let psv = container::psv(&Psv {
