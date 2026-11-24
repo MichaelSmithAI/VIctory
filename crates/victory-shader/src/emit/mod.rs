@@ -156,6 +156,8 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Table entries the program loads descriptors from.
+    pub table_reads: Vec<TableRead>,
 }
 
 impl HostShader {
@@ -170,6 +172,19 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+}
+
+/// A table entry a translated program loads a descriptor from: the
+/// table's user-data index and the dword in the table. The console's
+/// used-resource list names a range by its first entry; a program may read
+/// later entries of it (descriptor arrays), whose host slots a draw must
+/// make too. `dynamic`: the offset is only known at run time (at least
+/// `dword`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableRead {
+    pub user_data: u8,
+    pub dword: u32,
+    pub dynamic: bool,
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -308,6 +323,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        table_reads: l.table_reads,
     })
 }
 
@@ -565,6 +581,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            table_reads: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -575,6 +592,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                table_reads: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
