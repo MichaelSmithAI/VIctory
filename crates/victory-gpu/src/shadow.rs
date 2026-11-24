@@ -56,8 +56,8 @@ struct Before {
     spans: Vec<(usize, usize)>,
 }
 
-/// A title page's bytes in the copy before the submission ran: `[lo, hi)`
-/// of `bytes` (offsets in the page; a page's buffer is a page long).
+/// A title page's snapshot before the submission ran. The page-local
+/// bounds `[lo, hi)` can contain gaps outside the declared write spans.
 struct Snap {
     lo: usize,
     hi: usize,
@@ -179,6 +179,7 @@ impl Shadow {
         if from >= to || before.spans.iter().any(|&(a, b)| a <= from && to <= b) {
             return;
         }
+        let new = outside(from, to, before.spans.clone());
         let (mut a, mut b) = (from, to);
         before.spans.retain(|&(x, y)| {
             let meets = x <= b && a <= y;
@@ -188,25 +189,22 @@ impl Shadow {
             !meets
         });
         before.spans.push((a, b));
-        let mut at = from;
-        while at < to {
-            let (page, lo) = ((start + at) / PAGE, (start + at) % PAGE);
-            let hi = lo + (PAGE - lo).min(to - at);
-            let snap = before.pages.entry(page).or_insert_with(|| Snap {
-                lo,
-                hi: lo,
-                bytes: page_buffer(),
-            });
-            if lo < snap.lo {
-                snap.bytes[lo..snap.lo].copy_from_slice(host(page, lo, snap.lo));
-                snap.lo = lo;
+        for (mut at, to) in new {
+            while at < to {
+                let (page, lo) = ((start + at) / PAGE, (start + at) % PAGE);
+                let hi = lo + (PAGE - lo).min(to - at);
+                let snap = before.pages.entry(page).or_insert_with(|| Snap {
+                    lo,
+                    hi,
+                    bytes: page_buffer(),
+                });
+                // Save only newly declared bytes. A gap within a page may be
+                // refreshed before it is declared for writing.
+                snap.bytes[lo..hi].copy_from_slice(host(page, lo, hi));
+                snap.lo = snap.lo.min(lo);
+                snap.hi = snap.hi.max(hi);
+                at += hi - lo;
             }
-            if hi > snap.hi {
-                let from = snap.hi.max(snap.lo);
-                snap.bytes[from..hi].copy_from_slice(host(page, from, hi));
-                snap.hi = hi;
-            }
-            at += hi - lo;
         }
     }
 
@@ -233,7 +231,7 @@ impl Shadow {
                 let n = (PAGE - lo).min(to - at);
                 let Some(snap) = snapshot
                     .pages
-                    .get(&page)
+                    .get_mut(&page)
                     .filter(|s| s.lo <= lo && lo + n <= s.hi)
                 else {
                     at += n;
@@ -242,18 +240,21 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &snap.bytes[lo..lo + n];
+                let old = &mut snap.bytes[lo..lo + n];
                 let title = &mut scratch[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()) {
                         if *h != *o && *t != *h {
                             *t = *h;
                             changed = true;
                         }
                         *h = *t;
+                        // A later overlapping range must not see merged
+                        // title bytes as fresh GPU writes.
+                        *o = *t;
                     }
                     if changed {
                         crate::watch::writing(start + at, n);
@@ -396,6 +397,22 @@ impl Shadow {
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
     }
+}
+
+/// The portions of a span not covered by earlier declarations.
+fn outside(from: usize, to: usize, mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let (mut at, mut parts) = (from, Vec::new());
+    for (a, e) in ranges {
+        if at < to && a > at {
+            parts.push((at, a.min(to)));
+        }
+        at = at.max(e);
+    }
+    if at < to {
+        parts.push((at, to));
+    }
+    parts
 }
 
 struct Entry {
