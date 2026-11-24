@@ -106,6 +106,18 @@ impl Heap {
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
     }
+
+    /// Whether a fresh view table occupies only full slots in this heap.
+    #[cfg(any(windows, test))]
+    pub(crate) fn contains_view_table(&self, start: u64, count: u32) -> bool {
+        if self.desc.kind != VIEWS_KIND || count == 0 {
+            return false;
+        }
+        self.index(start).is_some_and(|first| {
+            start - self.start == u64::from(first) * 32
+                && count <= self.desc.count - first
+        })
+    }
 }
 
 const VIEWS_KIND: u32 = 0;
@@ -700,6 +712,11 @@ mod tests {
         assert_eq!(cpu % 64, 0);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), cpu);
         assert_eq!(increment_size(null, 0), 32);
+        let views = heap(h);
+        assert!(views.contains_view_table(cpu + 998 * 32, 2));
+        assert!(!views.contains_view_table(cpu + 998 * 32, 3));
+        assert!(!views.contains_view_table(cpu + 998 * 32 + 4, 2));
+        assert!(!views.contains_view_table(cpu, u32::MAX));
         // SAFETY: the heap holds 1000 descriptors of 32 bytes.
         unsafe { (cpu as *mut u8).add(999 * 32 + 31).write(1) };
         assert_eq!(increment_size(null, 9), 0);

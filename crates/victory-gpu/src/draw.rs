@@ -928,6 +928,11 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            if !heap.contains_view_table(table, n) {
+                once!(slot, n, "a fresh view table lies outside its title heap");
+                self.table_failed = true;
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
