@@ -667,6 +667,28 @@ mod tests {
         assert_eq!(out, 0x118);
     }
 
+    #[test]
+    fn suggested_1d_layout_is_linear() {
+        let mut d = ResourceDesc {
+            dimension: TEXTURE_1D,
+            ..desc(256, 1, 1, 54, 0) // DXGI_FORMAT_R16_FLOAT
+        };
+        for flags in [0, ALLOW_RENDER_TARGET] {
+            d.flags = flags;
+            let mut layout = 0;
+            assert_eq!(XGSuggestSwizzleMode(&d, 0, &mut layout), S_OK);
+            assert_eq!(layout, 0x100);
+            d.layout = layout;
+            let c = create(&d);
+            type Offset = extern "system" fn(This, u32, u32, u64, u32, u32, u32, *mut u32) -> u64;
+            let offset: Offset = slot(c, 6);
+            assert_eq!(offset(c, 0, 0, 3, 0, 0, 0, std::ptr::null_mut()), 6);
+            assert_eq!(offset(c, 0, 0, 255, 0, 0, 0, std::ptr::null_mut()), 510);
+            assert_eq!(offset(c, 0, 0, 256, 0, 0, 0, std::ptr::null_mut()), 0);
+            slot::<extern "system" fn(This) -> u32>(c, 1)(c);
+        }
+    }
+
     /// The title's calls: layout, then a copy in and out of each mip.
     #[test]
     fn layout_and_copies_through_the_object() {
