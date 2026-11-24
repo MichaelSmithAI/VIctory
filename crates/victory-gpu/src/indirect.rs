@@ -168,6 +168,10 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!("indirect argument clamp kind {kind}, {records} records, stride {stride}")
+        });
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
