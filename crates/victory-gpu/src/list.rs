@@ -1762,6 +1762,104 @@ mod tests {
         assert_eq!(result, payload, "producer_first={producer_first}");
     }
 
+    /// #700 follow-up (Agnes): the title resets and re-records a held list
+    /// right after submitting it; the held submission must run what was
+    /// submitted, and the new recording only if submitted.
+    #[test]
+    #[cfg(windows)]
+    fn a_held_list_reset_and_rerecorded_still_runs_its_submitted_commands() {
+        use std::time::{Duration, Instant};
+        if crate::host::host().is_none() {
+            eprintln!("no host GPU; skipped");
+            return;
+        }
+        type Submit = extern "system" fn(This, u32, *const This);
+        type Release = extern "system" fn(This) -> u32;
+        let null = std::ptr::null();
+        const PAYLOAD: u64 = 0x5a55_a11c;
+        const OTHER: u64 = 0x0b7e_0b7e;
+        const SENTINEL: u64 = 0xface_feed;
+        for resubmit in [false, true] {
+            let make_pair = || {
+                let (mut queue, mut allocator, mut list) = (null, null, null);
+                let direct = [0u32; 4];
+                assert_eq!(
+                    crate::queue::create_x(null, direct.as_ptr().cast(), &PAGEABLE_IIDS[0], &mut queue),
+                    S_OK
+                );
+                assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+                assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+                (queue, allocator, list)
+            };
+            let producer = make_pair();
+            let consumer = make_pair();
+            let words = Box::new([0u64, 0, SENTINEL, OTHER, SENTINEL, 0]); // [5]: completion marker
+            let at = |i: usize| (&raw const words[i]) as u64;
+            // Asynchronous writes: read through volatile loads only.
+            let rd = |i: usize| unsafe { std::ptr::read_volatile(at(i) as *const u64) };
+            write64(producer.2, at(0), PAYLOAD, 0, 0);
+            write64(producer.2, at(1), 2, 0, 0);
+            assert_eq!(close(producer.2), S_OK);
+            wait64(consumer.2, at(1), 7, 1, 0);
+            copy_memory(consumer.2, at(2), at(0), 8, 0);
+            assert_eq!(close(consumer.2), S_OK);
+            let submit = |queue: This, lists: &[This]| {
+                slot::<Submit>(queue, 0x50)(queue, lists.len() as u32, lists.as_ptr());
+            };
+            submit(consumer.0, &[consumer.2]);
+            assert_eq!(rd(2), SENTINEL, "the consumer waits");
+            assert_eq!(reset(consumer.2, consumer.1, null), S_OK);
+            copy_memory(consumer.2, at(4), at(3), 8, 0);
+            assert_eq!(close(consumer.2), S_OK);
+            if resubmit {
+                submit(consumer.0, &[consumer.2]);
+            }
+            // Completion marker: a list on the consumer queue behind the
+            // held work, so it is written only once that work has run.
+            let mut follower = null;
+            assert_eq!(create_list(null, 0, 0, consumer.1, null, &LIST_IIDS[1], &mut follower), S_OK);
+            write64(follower, at(5), 1, 0, 0);
+            assert_eq!(close(follower), S_OK);
+            submit(consumer.0, &[follower]);
+            // And a fence Signal on the consumer queue behind all of it.
+            let mut fence = null;
+            assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+            let completed = || slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence);
+            let q_signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(
+                consumer.0,
+                crate::queue::signal_slot(consumer.0),
+            );
+            assert_eq!(q_signal(consumer.0, fence, 1), S_OK);
+            // Visibility control: nothing behind the wait is visible yet.
+            assert_eq!(
+                (rd(2), rd(4), rd(5), completed()),
+                (SENTINEL, SENTINEL, 0, 0),
+                "held before the producer"
+            );
+            submit(producer.0, &[producer.2]);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while completed() < 1 || rd(5) != 1 {
+                assert!(Instant::now() < deadline, "held work never completed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let want_second = if resubmit { OTHER } else { SENTINEL };
+            slot::<Release>(follower, 0x10)(follower);
+            slot::<Release>(fence, 0x10)(fence);
+            eprintln!(
+                "resubmit={resubmit}: counter={:#x} result={:#x} second={:#x} marker={}",
+                rd(1), rd(2), rd(4), rd(5)
+            );
+            assert_eq!(rd(1), 2, "producer ran (resubmit={resubmit})");
+            assert_eq!(rd(2), PAYLOAD, "the submitted recording ran (resubmit={resubmit})");
+            assert_eq!(rd(4), want_second, "only a submitted recording runs (resubmit={resubmit})");
+            for (queue, allocator, list) in [consumer, producer] {
+                for object in [list, allocator, queue] {
+                    slot::<Release>(object, 0x10)(object);
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();

@@ -597,6 +597,14 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
 static FUNCTIONS: Table<36> = Table(queue_table(false));
 static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 
+/// Byte offset of a queue's Signal in its own table (tests outside this module).
+#[cfg(test)]
+pub(crate) fn signal_slot(q: This) -> usize {
+    // SAFETY: one of our queues; its first field is the table.
+    let table = unsafe { *q.cast::<*const *const ()>() };
+    if table == NEWER_FUNCTIONS.0.as_ptr() { 0x80 } else { 0x70 }
+}
+
 #[cfg(test)]
 pub(crate) fn test_queue() -> (This, usize) {
     let desc = QueueDesc {
