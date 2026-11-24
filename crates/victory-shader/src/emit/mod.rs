@@ -240,7 +240,7 @@ pub fn emit(
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
-            (13, _) => 1,
+            (4 | 5 | 13, _) => 1,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
