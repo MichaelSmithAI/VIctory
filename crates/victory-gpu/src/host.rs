@@ -76,24 +76,23 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A retired object, dropped on whatever thread finishes the submission.
-struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
-// SAFETY: what is retired is D3D12 objects (free-threaded) and the
-// reference-counted wrappers holding them, dropped once.
-unsafe impl Send for Retired {}
+/// A retired object, dropped on the thread that observes fence completion.
+struct Retired(#[allow(dead_code)] Box<dyn Send>);
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
-pub(crate) fn retire<T: 'static>(object: T) {
+/// Drops `object` once every submission running now has finished.
+pub(crate) fn retire<T: Send + 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
-        drop(object);
         return;
     }
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    // Completion can publish and drain between the first check and the lock.
+    if started > FINISHED.load(Ordering::Acquire) {
+        retired.push((started, Retired(Box::new(object))));
+    } else {
+        drop(retired);
+        drop(object);
+    }
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -108,6 +107,20 @@ fn bury(finished: u64) {
         done
     };
     drop(done);
+}
+
+fn fence_completed(completed: u64, target: u64) -> bool {
+    // D3D12 returns UINT64_MAX if the device was removed.
+    completed != u64::MAX && completed >= target
+}
+
+#[cfg(test)]
+#[test]
+fn retirement_uses_completed_fence_values() {
+    assert!(!fence_completed(4, 5));
+    assert!(fence_completed(5, 5));
+    assert!(fence_completed(6, 5));
+    assert!(!fence_completed(u64::MAX, 5));
 }
 
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
@@ -601,8 +614,13 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
+        // A submitted fence value is only a target. A failed signal or
+        // wait can leave it pending when the CPU reaches this point.
+        // SAFETY: the queue's fence stays live for the host's lifetime.
+        if fence_completed(unsafe { self.fence.GetCompletedValue() }, *submitted) {
+            FINISHED.store(this_submission, Ordering::Release);
+            bury(this_submission);
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
