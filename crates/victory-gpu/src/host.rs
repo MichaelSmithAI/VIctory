@@ -1986,6 +1986,26 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     use std::sync::Arc;
 
     #[test]
+    fn indirect_dispatch_without_a_pipeline_does_not_record_argument_work() {
+        let Some(host) = super::host() else {
+            eprintln!("indirect dispatch control skipped: no D3D12 device");
+            return;
+        };
+        let mut arguments = [1u32, 1, 1];
+        let address = arguments.as_mut_ptr() as u64;
+        crate::shadow::register(address as usize, address, size_of_val(&arguments) as u64);
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        let ran = state.execute_indirect(&list, (2, 12, 1), address, None);
+        let refreshed = !list.deferred().copies.is_empty();
+        crate::shadow::unregister(address as usize, address);
+
+        assert!(!ran);
+        assert!(!refreshed, "a declined dispatch needs no argument preparation");
+        assert!(list.budget.get().is_none(), "a declined dispatch needs no clamp");
+    }
+
+    #[test]
     fn a_texture_is_checked_once_per_submission() {
         let mut batch = Batch::default();
         let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));

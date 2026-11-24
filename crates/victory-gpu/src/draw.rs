@@ -985,6 +985,22 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        let compute = if kind == DISPATCH {
+            match crate::pipeline::host_pipeline(self.pipeline as This) {
+                Some(p) if p.compute => Some(p),
+                Some(_) => {
+                    why("a dispatch with a graphics pipeline");
+                    return false;
+                }
+                None => {
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_drop(self.pipeline as This);
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1021,10 +1037,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
-            },
+            DISPATCH => compute.is_some_and(|p| self.bind(list, p, true)),
             _ => false,
         };
         if !ran {
