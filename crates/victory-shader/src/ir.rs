@@ -15,8 +15,8 @@
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
 
-use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
+use crate::{HwStage, NativeProgram, ShaderError};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
 /// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
@@ -323,6 +323,18 @@ fn s_mov(dst: u8, src: u8, offset: usize) -> Result<Instruction, ShaderError> {
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
     build_with(code, wave64, vgprs, false)
+}
+
+/// Builds the IR for a parsed native program, using the same input
+/// preparation for runtime and offline translation.
+pub fn build_native(native: &NativeProgram) -> Result<Program, ShaderError> {
+    let spilled = native.stage == HwStage::Cs
+        && !native.layout.is_empty()
+        && native
+            .layout
+            .iter()
+            .all(|r| native.stage.user_sgpr(r.user_data) >= SPILL_FIRST);
+    build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)
 }
 
 /// [`build`]; with `spilled`, loads from the root-argument spill table that
@@ -1273,15 +1285,41 @@ mod tests {
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect();
-        let plain = build_with(&code, false, 256, false).unwrap();
-        assert!(
-            plain
+        let mut native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let has_spill_load = |program: &Program| {
+            program
                 .blocks
                 .iter()
                 .flat_map(|b| &b.insts)
                 .any(|i| i.name() == "s_load_dwordx4")
-        );
-        let p = build_with(&code, false, 256, true).unwrap();
+        };
+        assert!(has_spill_load(&build_native(&native).unwrap()));
+        native.layout.push(crate::RootParam {
+            root: crate::RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 20,
+            slot: 0,
+        });
+        let p = build_native(&native).unwrap();
+        native.layout.push(crate::RootParam {
+            user_data: 0,
+            slot: 1,
+            ..native.layout[0]
+        });
+        assert!(has_spill_load(&build_native(&native).unwrap()));
         let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
         assert!(!insts.iter().any(|i| i.name().starts_with("s_load")));
         // Table dwords 4..8 are user SGPRs 20..24.
