@@ -328,8 +328,8 @@ enum MaskData {
 const LANE_MASK: Why = "a lane mask read as data";
 
 /// Whether an ordinary first-lane read could see a different value in the
-/// other host half. Track straight-line arithmetic on scalar inputs and
-/// constants. A phi, a load or a partial write provides no such proof.
+/// other host half. Follow straight-line arithmetic and scalar dword loads
+/// at uniform addresses. Joins and partial writes provide no such proof.
 fn needs_first_lane_exchange(x: &Parts<'_>) -> bool {
     let ordinary_read = |i: &Inst| {
         i.name() == "v_readfirstlane_b32"
@@ -370,7 +370,7 @@ fn needs_first_lane_exchange(x: &Parts<'_>) -> bool {
             if x.st.reach[b] != Bool::TRUE || x.st.guards[b][n].is_some() {
                 continue;
             }
-            let pure = match &i.fields {
+            let uniform_result = match &i.fields {
                 Fields::Sop { src, .. } => {
                     // SOP2 arithmetic and SOPC comparisons depend on their
                     // operands, including implicit SCC for carries and selects.
@@ -378,6 +378,14 @@ fn needs_first_lane_exchange(x: &Parts<'_>) -> bool {
                         || matches!(i.name(), "s_mov_b32" | "s_mov_b64" | "s_movk_i32"))
                         && src.iter().all(known)
                         && i.reads.iter().all(|(_, v)| uniform.contains(v))
+                }
+                Fields::Smem { base, soffset, .. }
+                    if i.name().starts_with("s_load_dword")
+                        || i.name().starts_with("s_buffer_load_dword") =>
+                {
+                    // The immediate displacement is fixed. Check every word
+                    // of the address pair or descriptor, and the scalar offset.
+                    known(base) && known(soffset)
                 }
                 Fields::Valu(v) => {
                     v.dpp.is_none()
@@ -404,7 +412,7 @@ fn needs_first_lane_exchange(x: &Parts<'_>) -> bool {
                 }
                 _ => false,
             };
-            if pure {
+            if uniform_result {
                 uniform.extend(i.writes.iter().filter_map(|&(reg, v)| {
                     matches!(reg, Reg::V(_) | Reg::S(0..=105) | Reg::Scc).then_some(v)
                 }));

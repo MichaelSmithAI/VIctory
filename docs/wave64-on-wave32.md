@@ -73,7 +73,9 @@ ordinary `v_readfirstlane_b32` when the host supports 32-lane waves but
 cannot run 64-lane waves, the group has 33–64 threads, and the source
 is not known to be uniform. A group of up to 32 threads fits in
 one host wave. Straight-line scalar and vector arithmetic over uniform
-inputs and constants can also keep the per-lane form. Waterfall reads
+inputs and constants can also keep the per-lane form. This includes scalar
+dword loads when every word of the base address or buffer descriptor and
+the scalar byte offset are uniform. Waterfall reads
 keep their existing descriptor lowering. The existing console-flow
 exclusions still apply. When the first-lane read alone requests console
 flow and that lowering declines the program, the emitter retries the

@@ -67,6 +67,19 @@ const IN_HALF: &[u32] = &[
 ];
 
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
+    let StageIo::Cs(io) = &native.io else {
+        unreachable!()
+    };
+    let n = io.threads.iter().product::<u32>() * groups;
+    run_with_views(host, native, groups, &[View::RawUav(n)])
+}
+
+fn run_with_views(
+    host: &Host,
+    native: &crate::NativeProgram,
+    groups: u32,
+    views: &[View<'_>],
+) -> Result<Vec<u32>, String> {
     let target = host.target();
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
     // The validator, where one is installed: drivers take some modules it
@@ -79,17 +92,12 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
     }
     let (root, pso) = host.compute_pipeline(&cs)?;
     let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
-    let StageIo::Cs(io) = &native.io else {
-        unreachable!()
-    };
-    let n = io.threads.iter().product::<u32>() * groups;
-    let views = [View::RawUav(n)];
     let out = host.dispatch(
         &root,
         &pso,
         &Dispatch {
             roots: vec![(0, Root::Constants(data))],
-            views: &views,
+            views,
             samplers: &[],
             // One host group per console wave where the shader says so.
             groups: [groups * cs.group_waves, 1, 1],
@@ -1351,6 +1359,61 @@ const UNIFORM_FIRST_LANE: &[u32] = &[
     0x7E18_0504, // v_readfirstlane_b32 s12, v4
     0x7E04_020C, // v_mov_b32 v2, s12
 ];
+
+// Load a descriptor from the second table slot, then read a pair of
+// dwords from its buffer. The first-lane read uses the second dword.
+fn scalar_load_first_lane(offset: u32, threads: u32) -> crate::NativeProgram {
+    program(
+        &[
+            0xF408_0401,
+            0xFA00_0020, // s_load_dwordx4 s[16:19], s[2:3], 32
+            offset,      // defines s15, the buffer byte offset
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF424_0508,
+            0x1E00_0000, // s_buffer_load_dwordx2 s[20:21], s[16:19], s15
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E08_0215, // v_mov_b32 v4, s21
+            0x7E18_0504, // v_readfirstlane_b32 s12, v4
+            0x7E04_020C, // v_mov_b32 v2, s12
+        ],
+        threads,
+    )
+}
+
+#[test]
+fn first_lane_reads_of_uniform_scalar_loads_stay_per_lane() {
+    let target = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for threads in [48, 64] {
+        let p = scalar_load_first_lane(0x8F0F_8301, threads); // s_lshl_b32 s15, s1, 3
+        assert_eq!(wave_size(&emit_for(&p, target).unwrap().dxil), None);
+        // s_not_b32 s15, -1 gives zero, but is outside the arithmetic proof.
+        let unproven = scalar_load_first_lane(0xBE8F_07C1, threads);
+        assert_eq!(
+            wave_size(&emit_for(&unproven, target).unwrap().dxil),
+            Some(32)
+        );
+        for name in adapters().unwrap_or_default() {
+            let Ok(host) = Host::on(&name) else { continue };
+            if !host.target().runs(32) || host.target().runs(64) {
+                continue;
+            }
+            let out = run_with_views(
+                &host,
+                &p,
+                2,
+                &[View::RawUav(2 * threads), View::Cbv(&[11, 37, 13, 91])],
+            )
+            .unwrap();
+            assert_eq!(out.len(), 2 * threads as usize);
+            assert!(out[..threads as usize].iter().all(|&v| v == 37));
+            assert!(out[threads as usize..].iter().all(|&v| v == 91));
+            eprintln!("{name}: {threads} threads read 37 and 91 in the two groups");
+        }
+    }
+}
 
 #[test]
 fn first_lane_reads_declare_a_wave_only_for_a_varying_upper_half() {
