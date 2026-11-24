@@ -320,6 +320,42 @@ mod tests {
         assert_eq!(lasts, [('a', BUFFER_READ)]);
     }
 
+    /// A copy made for a command moves its buffers to the copy's states even
+    /// when the command writes them, and back after (#1405 review); a read
+    /// state already holds a copy source; a first use records the copy's
+    /// state for the prelude.
+    #[test]
+    fn buffer_states_move_a_written_copy_for_a_copy() {
+        let mut s = BufferStates::default();
+        s.next_command();
+        // The command binds the source for writing, then asks it read: it
+        // stays writable for the command...
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        // ...but a copy from it moves it to the copy source state and back.
+        assert_eq!(
+            s.around_copy(1, 'a', BUFFER_COPY_SOURCE),
+            Some(BUFFER_WRITE)
+        );
+        assert_eq!(s.update(2, 'b', BUFFER_READ), None);
+        assert_eq!(s.around_copy(2, 'b', BUFFER_COPY_SOURCE), None);
+        // First uses: a source starts read, a destination as the copy's.
+        assert_eq!(s.around_copy(3, 'c', BUFFER_COPY_SOURCE), None);
+        assert_eq!(s.around_copy(4, 'd', BUFFER_COPY_DEST), None);
+        assert_eq!(s.update(4, 'd', BUFFER_READ), Some(BUFFER_COPY_DEST));
+        let mut firsts: Vec<_> = s.firsts().map(|(r, f)| (*r, f)).collect();
+        firsts.sort_unstable();
+        assert_eq!(
+            firsts,
+            [
+                ('a', BUFFER_WRITE),
+                ('b', BUFFER_READ),
+                ('c', BUFFER_READ),
+                ('d', BUFFER_COPY_DEST)
+            ]
+        );
+    }
+
     /// Set in the child process `in_child` starts.
     const CHILD: &str = "VICTORY_TEST_DEBUG_LAYER_CHILD";
 
@@ -691,8 +727,9 @@ type States = std::collections::HashMap<
 pub(crate) const BUFFER_READ: u32 = D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32;
 /// Shader writes to a host copy of title memory.
 pub(crate) const BUFFER_WRITE: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
-/// A host copy of title memory that a copy on the GPU writes.
-pub(crate) const BUFFER_COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+/// A host copy of title memory a copy on the GPU reads, and one it writes.
+const BUFFER_COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+const BUFFER_COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
 
 /// The states of the host copies of title memory (buffers) one list uses,
 /// by copy: the state it starts in and the one it is in now. A buffer is in
@@ -755,13 +792,6 @@ impl<R> BufferStates<R> {
         }
     }
 
-    /// Temporarily use a buffer for a copy during command preparation.
-    /// Existing bindings still need their original state when the command runs.
-    fn state_for_copy(&mut self, copy: usize, resource: R, wanted: u32) -> Option<u32> {
-        let state = self.by_copy.entry(copy).or_insert((wanted, wanted, None, resource));
-        (state.1 != wanted).then_some(state.1)
-    }
-
     /// The prelude's transitions: each buffer from common to its first state.
     pub(crate) fn firsts(&self) -> impl Iterator<Item = (&R, u32)> {
         self.by_copy.values().map(|(first, _, _, r)| (r, *first))
@@ -771,6 +801,31 @@ impl<R> BufferStates<R> {
     /// to common.
     pub(crate) fn lasts(&self) -> impl Iterator<Item = (&R, u32)> {
         self.by_copy.values().map(|(_, last, _, r)| (r, *last))
+    }
+
+    /// A copy on the GPU recorded in the list for the current command, with
+    /// `copy` (`resource`) as its source or destination (`state`): the state
+    /// to move it from to `state`, and back to after the copy, if any. Unlike
+    /// [`BufferStates::update`], the command's own write does not win: the
+    /// copy runs before the command, so the buffer must be in the copy's
+    /// state then. A first use records the state for the prelude (for a
+    /// source, the read state, which holds it).
+    pub(crate) fn around_copy(&mut self, copy: usize, resource: R, state: u32) -> Option<u32> {
+        match self.by_copy.entry(copy) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let first = if BUFFER_READ & state == state {
+                    BUFFER_READ
+                } else {
+                    state
+                };
+                v.insert((first, first, None, resource));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(o) => {
+                let now = o.get().1;
+                (now & state != state).then_some(now)
+            }
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1459,42 +1514,6 @@ impl HostList {
             .collect()
     }
 
-    /// Copy the parent-backed bytes that a strided view needs before this
-    /// draw or dispatch, then restore states of buffers already bound.
-    pub(crate) fn copy_buffer_ranges(
-        &self,
-        dst: &crate::shadow::Shadow,
-        src: &crate::shadow::Shadow,
-        ranges: &[Range<usize>],
-    ) {
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let mut before = Vec::new();
-        let mut after = Vec::new();
-        for (buffer, wanted) in [(&src.buffer, BUFFER_READ), (&dst.buffer, BUFFER_COPY_DEST)] {
-            if let Some(prior) = buffers.state_for_copy(buffer.as_raw() as usize, buffer.clone(), wanted) {
-                let prior = D3D12_RESOURCE_STATES(prior as i32);
-                let wanted = D3D12_RESOURCE_STATES(wanted as i32);
-                before.push(transition(buffer, prior, wanted));
-                after.push(transition(buffer, wanted, prior));
-            }
-        }
-        // SAFETY: both buffers are held by the list; each range is in both copies.
-        unsafe {
-            if !before.is_empty() {
-                self.list.ResourceBarrier(&before);
-            }
-            for range in ranges {
-                let at = range.start as u64;
-                self.list.CopyBufferRegion(
-                    &dst.buffer, dst.offset(at), &src.buffer, src.offset(at), range.len() as u64,
-                );
-            }
-            if !after.is_empty() {
-                self.list.ResourceBarrier(&after);
-            }
-        }
-    }
-
     /// Moves a host copy of title memory to `wanted` ([`BUFFER_READ`] or
     /// [`BUFFER_WRITE`]) in this list: see [`BufferStates`].
     pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: u32) {
@@ -1507,6 +1526,44 @@ impl HostList {
             );
             // SAFETY: an open list and a buffer the list holds.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
+    /// Copy overlapping view ranges while preserving both buffers' binding states.
+    pub(crate) fn copy_buffer_ranges(
+        &self,
+        dst: &crate::shadow::Shadow,
+        src: &crate::shadow::Shadow,
+        ranges: &[Range<usize>],
+    ) {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut there, mut back) = (Vec::new(), Vec::new());
+        for (buffer, state) in [(&src.buffer, BUFFER_COPY_SOURCE), (&dst.buffer, BUFFER_COPY_DEST)] {
+            let key = buffer.as_raw() as usize;
+            if let Some(now) = buffers.around_copy(key, buffer.clone(), state) {
+                let (now, state) = (
+                    D3D12_RESOURCE_STATES(now as i32),
+                    D3D12_RESOURCE_STATES(state as i32),
+                );
+                there.push(transition(buffer, now, state));
+                back.push(transition(buffer, state, now));
+            }
+        }
+        // SAFETY: an open list; both buffers are host copies the list holds
+        // (its buffer states keep them), with each range inside both copies.
+        unsafe {
+            if !there.is_empty() {
+                self.list.ResourceBarrier(&there);
+            }
+            for range in ranges {
+                let at = range.start as u64;
+                self.list.CopyBufferRegion(
+                    &dst.buffer, dst.offset(at), &src.buffer, src.offset(at), range.len() as u64,
+                );
+            }
+            if !back.is_empty() {
+                self.list.ResourceBarrier(&back);
+            }
         }
     }
 

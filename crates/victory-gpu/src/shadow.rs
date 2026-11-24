@@ -146,8 +146,10 @@ impl Shadow {
         let copies: Vec<Arc<Shadow>> = ALIGNED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .range((first, 0)..(end, 0))
-            .filter(|((start, len), _)| start + len > base)
+            .range((first, 0, 0)..(end, 0, 0))
+            .filter(|((start, len, from), _)| {
+                start + len > base && std::ptr::eq(*from as *const Shadow, self)
+            })
             .filter_map(|(_, copy)| copy.upgrade())
             .collect();
         for copy in copies {
@@ -514,11 +516,15 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-/// Copies of just one view's bytes, by (start, length): for a view whose
-/// start is not on an element of its host copy (`aligned`). The heap slot
-/// holds the copy; this map only finds it again, so it holds weak references
-/// and the copy goes when the slot is remade.
-static ALIGNED: Mutex<BTreeMap<(u64, u64), std::sync::Weak<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Copies of just one view's bytes, by (start, length, the buffer's copy they
+/// were cut from): for a view whose start is not on an element of its host
+/// copy (`aligned`). A copy follows the one it was cut from, so the same
+/// bytes cut from another (a title buffer released and registered again)
+/// get a copy of their own. The heap slot holds the copy; this map only
+/// finds it again, so it holds weak references and the copy goes when the
+/// slot is remade.
+static ALIGNED: Mutex<BTreeMap<(u64, u64, usize), std::sync::Weak<Shadow>>> =
+    Mutex::new(BTreeMap::new());
 
 /// The longest range `aligned` has made a copy of: how far before a piece
 /// of title memory such a copy can start and still reach into it.
@@ -544,8 +550,8 @@ pub(crate) fn aligned(address: u64, len: u64, from: &Arc<Shadow>) -> Option<Arc<
     if len == 0 {
         return None;
     }
-    let key = (address, len);
-    if let Some(copy) = aligned_existing(address, len) {
+    let key = (address, len, Arc::as_ptr(from) as usize);
+    if let Some(copy) = aligned_existing(address, len, from) {
         return Some(copy);
     }
     // Views hold hundreds of megabytes in the world; made as a buffer's copy
@@ -575,12 +581,12 @@ pub(crate) fn aligned(address: u64, len: u64, from: &Arc<Shadow>) -> Option<Arc<
     Some(copy)
 }
 
-/// The copy `aligned` made for this range, if one is still alive.
-pub(crate) fn aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+/// The copy `aligned` made of this range from `from`, if one is still alive.
+pub(crate) fn aligned_existing(address: u64, len: u64, from: &Arc<Shadow>) -> Option<Arc<Shadow>> {
     ALIGNED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&(address, len))
+        .get(&(address, len, Arc::as_ptr(from) as usize))
         .and_then(std::sync::Weak::upgrade)
 }
 
@@ -726,7 +732,7 @@ mod tests {
                     .map(|job| job.join().unwrap())
                     .collect::<Vec<_>>()
             });
-            let refreshed = aligned_existing(address, len).expect("cached copy");
+            let refreshed = aligned_existing(address, len, &from).expect("cached copy");
             refreshed.update(address as usize, len as usize);
             for copy in copies {
                 assert!(Arc::ptr_eq(&copy, &refreshed), "slot retained a different copy");
@@ -819,6 +825,36 @@ mod tests {
         assert!(own.fed_from().is_some_and(|f| Arc::ptr_eq(f, &from)));
         // A view cut from another copy is not marked by this one.
         assert!(elsewhere.fed_from().is_none());
+        drop(memory);
+    }
+
+    /// The same bytes cut from two copies of the same title memory (a buffer
+    /// released and registered again) get two copies, each following the
+    /// one it was cut from (#1405 review).
+    #[test]
+    fn the_same_bytes_cut_from_two_copies_follow_each_their_own() {
+        let mut memory = vec![1u8; 4096];
+        let title = memory.as_mut_ptr() as usize;
+        let Some(old) = buffer_copy(title as u64, 4096) else {
+            return; // no host GPU
+        };
+        let new = buffer_copy(title as u64, 4096).expect("another copy");
+        let (at, len) = (title as u64 + 48, 224);
+        let from_old = aligned(at, len, &old).expect("a copy cut from the old one");
+        let from_new = aligned(at, len, &new).expect("a copy cut from the new one");
+        assert!(!Arc::ptr_eq(&from_old, &from_new));
+        assert!(Arc::ptr_eq(
+            &aligned(at, len, &new).expect("found again"),
+            &from_new
+        ));
+        // Shaders write the view's bytes in the new copy only.
+        new.copy(title, title + 4096);
+        new.writing(title, 4096);
+        // SAFETY: inside the copy's mapping.
+        unsafe { std::ptr::write_bytes(new.data.add(48), 7, 56) };
+        new.copy_back(title, 4096);
+        assert!(from_new.fed_from().is_some_and(|f| Arc::ptr_eq(f, &new)));
+        assert!(from_old.fed_from().is_none());
         drop(memory);
     }
 }
