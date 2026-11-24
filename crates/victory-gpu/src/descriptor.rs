@@ -704,6 +704,206 @@ mod tests {
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn runtime_stride_reads_the_exact_structured_srv_window() {
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let words = [
+            0xBE85_0380u32, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // read the SRV record
+            0xF408_0302,
+            0xFA00_0020, // read the UAV record
+            0x7E00_0281, // element 1
+            0x7E02_0284, // byte offset 4 into that element
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x7E00_0200, // output byte offset from s0
+            0xE070_1000,
+            0x8003_0200, // buffer_store_dword v2, v0, s[12:15], 0 offen
+            0xBF81_0000,
+        ];
+        let param = |root, sgprs, user_data, slot| RootParam {
+            root,
+            sgprs,
+            user_data,
+            slot,
+            base_register: 0,
+            table_offset_dwords: 0,
+        };
+        let used = |kind, table_offset_dwords| UsedResource {
+            kind,
+            table_offset_dwords,
+            root: RootType::Table,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                param(RootType::Constants, 4, 0, 0),
+                param(RootType::Table, 1, 4, 1),
+            ],
+            used: vec![used(ResourceType::Srv, 0), used(ResourceType::Uav, 8)],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let p = victory_shader::ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(shader.stride_table, [(1, 0)]);
+        let pipeline = crate::pipeline::test_compute_pipeline(shader, native.used);
+        let null = std::ptr::null();
+        let mut heap_obj = null;
+        assert_eq!(
+            create(
+                HeapDesc {
+                    kind: 0,
+                    count: 2,
+                    flags: 1,
+                    nodes: 0
+                },
+                Placement {
+                    address: 0,
+                    size: 0
+                },
+                &mut heap_obj
+            ),
+            S_OK
+        );
+        let heap = heap(heap_obj);
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let allocate = || {
+            // SAFETY: allocate a write-watched page for shadow refresh and copy-back.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    64 << 10,
+                    MEM_RESERVE | MEM_COMMIT | 0x20_0000,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!p.is_null());
+            p as u64
+        };
+        let src = allocate();
+        let dst = allocate();
+        crate::shadow::register(src as usize, src, 64);
+        crate::shadow::register(dst as usize, dst, 64);
+        for i in 0..16 {
+            // SAFETY: the 16 initialized dwords are within the allocation.
+            unsafe { (src as *mut u32).add(i).write(100 + i as u32) };
+        }
+        let mut resource = [0; 14];
+        resource[0] = 1; // BUFFER
+        resource[4] = 64;
+        let mut srv = [0; 16];
+        srv[1] = 1; // BUFFER SRV
+        srv[2] = 5768; // default component mapping
+        srv[4] = 1; // FirstElement
+        srv[6] = 2; // NumElements
+        srv[7] = 16; // StructureByteStride
+        srv[10] = src as u32;
+        srv[11] = (src >> 32) as u32;
+        create_placed_srv(null, &resource, &srv, heap.start);
+        let mut uav = [0; 16];
+        uav[0] = 39; // R32_TYPELESS
+        uav[1] = 1; // BUFFER UAV
+        uav[4] = 16; // NumElements
+        uav[8] = 1; // RAW
+        uav[10] = dst as u32;
+        uav[11] = (dst >> 32) as u32;
+        create_placed_uav(null, &resource, &uav, heap.start + 32);
+
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pipeline);
+        state.set_heaps(&[heap_obj]);
+        state.set_table(true, 1, heap.start);
+        // Leave one dynamic descriptor available. A structured view starting
+        // at byte four cannot form a raw SRV and must return that lease.
+        let host_heap = heap.host().unwrap();
+        let all_slots = 1 << 16;
+        let first = host_heap.dynamic(all_slots).unwrap();
+        let last = first + all_slots - 1;
+        host_heap.release(last, 1);
+        let mut unaligned = srv;
+        unaligned[7] = 4;
+        create_placed_srv(null, &resource, &unaligned, heap.start);
+        state.set_constants(true, 0, &[16], 0);
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(
+            host_heap.dynamic(1),
+            Some(last),
+            "a rejected alias bind must release its unsubmitted lease"
+        );
+        host_heap.release(first, all_slots);
+        create_placed_srv(null, &resource, &srv, heap.start);
+
+        state.set_constants(true, 0, &[20], 0);
+        state.dispatch(&list, 1, 1, 1);
+
+        // Record another alias of the original slot before the list runs.
+        // The first dispatch must retain its original nonzero FirstElement.
+        srv[4] = 0;
+        create_placed_srv(null, &resource, &srv, heap.start);
+        state.set_constants(true, 0, &[24], 0);
+        state.dispatch(&list, 1, 1, 1);
+        // A legal raw input retains the stride-four behavior of the original PR.
+        let mut raw = srv;
+        raw[0] = 39; // R32_TYPELESS
+        raw[6] = 16; // NumElements
+        raw[7] = 0;
+        raw[8] = 1; // RAW
+        create_placed_srv(null, &resource, &raw, heap.start);
+        state.set_constants(true, 0, &[28], 0);
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: dword 4 is in the output range and was never dispatched.
+        assert_eq!(unsafe { (dst as *const u32).add(4).read() }, 0);
+        // SAFETY: dword 5 is within the registered output range.
+        assert_eq!(unsafe { (dst as *const u32).add(5).read() }, 109);
+        // SAFETY: dword 6 is within the registered output range.
+        assert_eq!(unsafe { (dst as *const u32).add(6).read() }, 105);
+        // SAFETY: dword 7 is within the registered output range.
+        assert_eq!(unsafe { (dst as *const u32).add(7).read() }, 102);
+        assert_eq!(view(heap.start), Some(View::Placed(false, resource, raw)));
+        drop(state);
+        release(heap_obj);
+        slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
+        crate::shadow::unregister(src as usize, src);
+        crate::shadow::unregister(dst as usize, dst);
+        // SAFETY: both ranges came from VirtualAlloc above and are retired.
+        unsafe {
+            VirtualFree(src as *mut _, 0, MEM_RELEASE);
+            VirtualFree(dst as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();

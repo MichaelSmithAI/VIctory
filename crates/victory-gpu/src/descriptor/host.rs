@@ -30,63 +30,6 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
-    /// Per-slot element byte stride (`u32`) for structured buffers whose
-    /// stride shader analysis could not recover statically.
-    strides: Option<StrideTable>,
-}
-
-struct StrideTable {
-    _resource: ID3D12Resource,
-    ptr: usize,
-    gpu: u64,
-    len: u32,
-}
-
-impl StrideTable {
-    fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = (u64::from(len) * 4).max(4);
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: bytes,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let mut resource: Option<ID3D12Resource> = None;
-        let mut p = std::ptr::null_mut();
-        // SAFETY: plain committed upload buffer creation and persistent CPU map.
-        let gpu = unsafe {
-            device
-                .CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES {
-                        Type: D3D12_HEAP_TYPE_UPLOAD,
-                        ..Default::default()
-                    },
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut resource,
-                )
-                .ok()?;
-            let res = resource.as_ref()?;
-            res.Map(0, None, Some(&mut p)).ok()?;
-            std::ptr::write_bytes(p.cast::<u8>(), 0, bytes as usize);
-            res.GetGPUVirtualAddress()
-        };
-        Some(Self {
-            _resource: resource?,
-            ptr: p as usize,
-            gpu,
-            len,
-        })
-    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -175,11 +118,6 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
-        let strides = if sampler {
-            None
-        } else {
-            StrideTable::new(&host.device, count + extra)
-        };
         let h = HostHeap {
             heap,
             cpu,
@@ -189,7 +127,6 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            strides,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -339,7 +276,42 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, if ok { view_stride(view) } else { 0 });
+    }
+
+    /// Makes a separately leased raw SRV over a structured or raw buffer view.
+    pub(crate) fn structured_read_alias(
+        &self,
+        index: u32,
+        view: &View,
+        list: &crate::host::HostList,
+    ) -> Option<[u32; 4]> {
+        let (address, len, words) = match view {
+            View::Shader(resource, Some(words)) => {
+                let (base, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+                (base as u64, len, words)
+            }
+            View::Placed(false, resource, desc) if resource[0] == 1 => (
+                u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                u64::from(resource[4]) | u64::from(resource[5]) << 32,
+                desc[..10].try_into().ok()?,
+            ),
+            _ => return None,
+        };
+        let shadow = crate::shadow::find(address, len)?;
+        let (raw, start, bytes, stride, count) =
+            raw_read_window(&srv_desc(words), shadow.offset(address), len)?;
+        let refresh_at = address.checked_add(start)?;
+        shadow.refresh(list, refresh_at, u64::from(bytes));
+        let host = host()?;
+        // SAFETY: the alias occupies a leased dynamic slot, and its extent
+        // is entirely inside the live backing buffer.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(&shadow.buffer, Some(&raw), self.cpu(index));
+        }
+        list.keep(&shadow.buffer);
+        self.keep(index, Some(shadow.buffer.clone()));
+        Some([index, stride, bytes, count])
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -350,7 +322,6 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, 0);
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -361,25 +332,10 @@ impl HostHeap {
         }
     }
 
-    fn set_stride(&self, index: u32, stride: u32) {
-        if let Some(t) = &self.strides
-            && index < t.len
-        {
-            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of `t.len` dwords.
-            unsafe { *(t.ptr as *mut u32).add(index as usize) = stride };
-        }
-    }
-
-    /// GPU virtual address of the per-slot element byte stride table.
-    pub(crate) fn stride_table_gpu(&self) -> Option<u64> {
-        self.strides.as_ref().map(|t| t.gpu)
-    }
-
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
-        self.set_stride(index, 0);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -445,7 +401,6 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
-            self.set_stride(index, if ok { view_stride(&view) } else { 0 });
         }
         Some(view)
     }
@@ -563,26 +518,6 @@ fn uav_element_size(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<u64> {
     }
 }
 
-/// Element byte stride of `view` for the runtime stride table (`0` for
-/// non-buffer views or descriptors without a known element size).
-fn view_stride(view: &View) -> u32 {
-    let bytes = match view {
-        View::Shader(_, Some(desc)) => element_size(&srv_desc(desc)),
-        View::Placed(false, resource, desc) if resource[0] == 1 => desc[..10]
-            .try_into()
-            .ok()
-            .map_or(0, |w: &[u32; 10]| element_size(&srv_desc(w))),
-        View::Unordered(_, _, Some(desc)) => uav_element_size(&uav_desc(desc)).unwrap_or(0),
-        View::Placed(true, resource, desc) if resource[0] == 1 => desc[..10]
-            .try_into()
-            .ok()
-            .and_then(|w: &[u32; 10]| uav_element_size(&uav_desc(w)))
-            .unwrap_or(0),
-        _ => 0,
-    };
-    u32::try_from(bytes).unwrap_or(0)
-}
-
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
@@ -625,6 +560,52 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
+}
+
+/// Raw descriptor and exact byte window of a buffer view.
+fn raw_read_window(
+    desc: &D3D12_SHADER_RESOURCE_VIEW_DESC,
+    host_offset: u64,
+    len: u64,
+) -> Option<(D3D12_SHADER_RESOURCE_VIEW_DESC, u64, u32, u32, u32)> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the descriptor dimension was checked above.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    let stride = match (desc.Format, buffer.Flags, buffer.StructureByteStride) {
+        (DXGI_FORMAT_UNKNOWN, D3D12_BUFFER_SRV_FLAG_NONE, stride)
+            if stride > 0 && stride.is_multiple_of(4) =>
+        {
+            stride
+        }
+        (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_SRV_FLAG_RAW, 0) => 4,
+        _ => return None,
+    };
+    let count = buffer.NumElements;
+    let start = buffer.FirstElement.checked_mul(u64::from(stride))?;
+    let bytes = count.checked_mul(stride)?;
+    let first = host_offset.checked_add(start)?;
+    if bytes == 0
+        || start.checked_add(u64::from(bytes))? > len
+        || !first.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT))
+    {
+        return None;
+    }
+    let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: first / 4,
+                NumElements: bytes / 4,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    };
+    Some((raw, start, bytes, stride, count))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`

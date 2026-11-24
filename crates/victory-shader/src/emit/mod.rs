@@ -154,9 +154,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
-    /// True when the shader reads the runtime stride table (`t0` in
-    /// [`STRIDE_SPACE`]).
-    pub stride_table: bool,
+    /// Guest table slot and dword for each immutable runtime stride row
+    /// read from `t0` in [`STRIDE_SPACE`].
+    pub stride_table: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -494,7 +494,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
-            stride_table: false,
+            stride_table: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -505,7 +505,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
-                stride_table: false,
+                stride_table: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -609,21 +609,13 @@ mod tests {
             0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
             0xF408_0302,
             0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
-            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E00_0281, // v_mov_b32 v0, 1
             0x7E02_0284, // v_mov_b32 v1, 4
             0xE030_3000,
             0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
-            0x7E00_0281, // v_mov_b32 v0, 1
-            0x7E02_0288, // v_mov_b32 v1, 8
-            0xE070_3000,
-            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
-            0x7E00_0282, // v_mov_b32 v0, 2
-            0x7E02_0280, // v_mov_b32 v1, 0
-            0x7E06_028A, // v_mov_b32 v3, 10
-            0xE0C8_3000,
-            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
-            0xE0C8_3000,
-            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0xE070_1000,
+            0x8003_0200, // buffer_store_dword v2, v0, s[12:15], 0 offen
             0xBF81_0000, // s_endpgm
         ];
         let native = super::NativeProgram {
@@ -676,23 +668,56 @@ mod tests {
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
-        let st = crate::structure::structure(&p).unwrap();
-        let l = super::lower::lower(&super::lower::Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
-        })
-        .unwrap();
-        assert!(l.stride_table);
+        let lower = |native: &super::NativeProgram| {
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = crate::io::raise(&p, native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            super::lower::lower(&super::lower::Parts {
+                native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+        };
+        let l = lower(&native).unwrap();
+        assert_eq!(l.stride_table, [(1, 0)]);
+
+        let mut with_write = native;
+        let mut body = words[..words.len() - 4].to_vec();
+        body.extend_from_slice(&[
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0288, // v_mov_b32 v1, 8
+            0xE070_3000,
+            0x8003_0200, // indexed store
+            0xBF81_0000,
+        ]);
+        with_write.code = body.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert!(matches!(
+            lower(&with_write),
+            Err(crate::ShaderError::Unsupported {
+                what: "a structured buffer of unknown stride",
+                ..
+            })
+        ));
+        let op = body.len() - 3;
+        body[op] = 0xE0C8_3000; // indexed atomic add
+        with_write.code = body.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert!(matches!(
+            lower(&with_write),
+            Err(crate::ShaderError::Unsupported {
+                what: "a structured buffer of unknown stride",
+                ..
+            })
+        ));
+        with_write.used[1].stride = 12;
+        assert!(lower(&with_write).is_ok());
+
         let mut dxil = l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -720,12 +745,12 @@ mod tests {
                     &pso,
                     &super::host::Dispatch {
                         roots: vec![
-                            (0, super::host::Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (0, super::host::Root::Constants(vec![20, 0, 0, 0, 0])),
                             (
                                 1,
                                 super::host::Root::View {
                                     srv: true,
-                                    data: vec![12, 12],
+                                    data: vec![0, 12, 48, 4],
                                 },
                             ),
                         ],
@@ -741,8 +766,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            assert_eq!(out[0][5], 107);
-            assert_eq!(out[0][6], 20);
+            assert_eq!(out[0][5], 104);
         }
     }
 }

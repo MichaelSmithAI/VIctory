@@ -239,8 +239,8 @@ impl Shader {
     }
 
     /// The handle of the host's runtime stride table (`t0` in
-    /// [`STRIDE_SPACE`], a raw buffer of `u32` byte strides indexed by
-    /// view-heap slot).
+    /// [`STRIDE_SPACE`], a raw buffer of fixed rows for the shader's
+    /// exact table bindings).
     pub fn stride_table_handle(&mut self) -> V {
         if let Some(h) = self.stride_table {
             return h;
