@@ -202,6 +202,15 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The already-made host pipeline, for diagnostics that do not start work.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn existing_host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    make::existing(&pipeline(this).host)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

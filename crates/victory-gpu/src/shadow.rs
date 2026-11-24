@@ -445,6 +445,27 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Finds a host copy without allocating one for a diagnostic lookup.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    if let Some((_, entry)) = buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, entry)| entry.end >= end)
+    {
+        return entry.shadow.clone();
+    }
+    let start = address & !(WINDOW - 1);
+    let len = end.checked_next_multiple_of(WINDOW)? - start;
+    LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(start, len))
+        .cloned()
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;

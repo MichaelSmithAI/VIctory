@@ -651,9 +651,8 @@ impl State {
     /// was looked at (else the pipeline's).
     #[cfg(feature = "diagnostics")]
     fn frame_op_why(&self, kind: &str, compute: bool, ran: bool, why: Option<&str>) {
-        if !tracing::enabled!(tracing::Level::DEBUG)
-            || !crate::capture::listed(crate::queue::presented() + 1)
-        {
+        let frame = crate::queue::presented() + 1;
+        if !tracing::enabled!(tracing::Level::DEBUG) || !crate::capture::listed(frame) {
             return;
         }
         let targets: Vec<String> = if compute {
@@ -674,8 +673,7 @@ impl State {
         };
         let text = self.op_text(kind.to_owned(), compute);
         tracing::debug!(
-            "frame {} op: pipeline {:#x} topology {} targets {targets:?} depth {:#x} -> {outcome} || {text}",
-            crate::queue::presented() + 1,
+            "frame {frame} op: pipeline {:#x} topology {} targets {targets:?} depth {:#x} -> {outcome} || {text}",
             self.pipeline,
             self.topology,
             self.depth
@@ -689,12 +687,12 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::existing_host_pipeline(self.pipeline as This) else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
         let views = (self.heaps[0] != 0)
-            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).existing_host())
             .flatten();
         for stage in &p.stages {
             let t = stage.translated();
@@ -709,7 +707,7 @@ impl State {
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                    let host = crate::shadow::find(*address, 1)
+                    let host = crate::shadow::existing(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
@@ -947,7 +945,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::existing_host_pipeline(self.pipeline as This) else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -956,8 +954,11 @@ impl State {
             for u in &t.used {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
-                        let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::view(handle).as_ref())
+                        let view = table
+                            .checked_add(u64::from(u.table_offset_dwords) * 4)
+                            .filter(|&handle| self.heap_of(handle).is_some())
+                            .and_then(crate::descriptor::view);
+                        describe(view.as_ref())
                     }
                     (root, _) => format!("{root:?}"),
                 };

@@ -68,6 +68,12 @@ impl Pending {
     }
 }
 
+/// A completed host pipeline, without queuing, waiting, or marking use.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn existing(p: &Pending) -> Option<&HostPipeline> {
+    p.made.get()?.as_ref()
+}
+
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
