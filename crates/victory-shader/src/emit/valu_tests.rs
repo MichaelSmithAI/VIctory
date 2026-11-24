@@ -165,6 +165,7 @@ fn lower_cs_with(words: &[u32], s4_root: RootType) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         table_reads: lowered.table_reads,
+        group_waves: lowered.group_waves,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

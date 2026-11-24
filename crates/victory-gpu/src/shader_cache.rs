@@ -226,6 +226,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
+    word(&mut out, s.group_waves);
     out
 }
 
@@ -292,6 +293,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             dynamic: r.word()? != 0,
         });
     }
+    let group_waves = r.word()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -302,6 +304,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         table_reads,
+        group_waves,
     })
 }
 
@@ -334,6 +337,7 @@ mod tests {
                 dword: 8,
                 dynamic: true,
             }],
+            group_waves: 4,
         }
     }
 
