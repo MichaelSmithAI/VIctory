@@ -6994,6 +6994,35 @@ mod tests {
     }
 
     #[test]
+    fn a_pc_read_stays_missing_through_two_live_joins() {
+        let mut words = [
+            0xBE86_1F00, // s_getpc_b64 s[6:7]
+            0xBF80_0000, // s_nop 0 to keep the same branch offsets
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // skip the first overwrite
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
+            0xBF85_0001, // skip the second overwrite
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // use the result to branch
+            0xBF8A_0000, // s_barrier on one group-uniform branch
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        // Compare to a direct read so future PC support works in both cases.
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [&words[..2], &words[8..]].concat();
+        assert_eq!(refusal(&words), refusal(&direct));
+        words[8] = 0xBF07_8000; // read the group id instead; the PC is dead
+        lowers(&words, group_ids_xy).expect("dead PC");
+    }
+
+    #[test]
     fn buffer_formats_by_number() {
         // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
         // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
