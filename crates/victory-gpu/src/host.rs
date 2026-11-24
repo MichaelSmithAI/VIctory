@@ -67,6 +67,65 @@ unsafe impl Sync for Host {}
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
+/// Host objects the title let go of while a submission may still use them
+/// (a texture its descriptors name, a descriptor slot's old resource), by
+/// the submission count they wait for. The title's descriptor writes and
+/// releases reach the host at once, from its own threads, while the host
+/// runs a submission for most of a second in the world: freeing there was
+/// a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
+/// 2026-11-24, RX 7600).
+static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+/// Submissions started and finished (waited for).
+static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A retired object, dropped on the thread that observes fence completion.
+struct Retired(#[allow(dead_code)] Box<dyn Send>);
+
+/// Drops `object` once every submission running now has finished.
+pub(crate) fn retire<T: Send + 'static>(object: T) {
+    let started = STARTED.load(Ordering::Acquire);
+    if started <= FINISHED.load(Ordering::Acquire) {
+        return;
+    }
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    // Completion can publish and drain between the first check and the lock.
+    if started > FINISHED.load(Ordering::Acquire) {
+        retired.push((started, Retired(Box::new(object))));
+    } else {
+        drop(retired);
+        drop(object);
+    }
+}
+
+/// Drops what waited for submissions up to `finished`.
+fn bury(finished: u64) {
+    let done: Vec<(u64, Retired)> = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        if retired.is_empty() {
+            return;
+        }
+        let (done, keep) = std::mem::take(&mut *retired).into_iter().partition(|(at, _)| *at <= finished);
+        *retired = keep;
+        done
+    };
+    drop(done);
+}
+
+fn fence_completed(completed: u64, target: u64) -> bool {
+    // D3D12 returns UINT64_MAX if the device was removed.
+    completed != u64::MAX && completed >= target
+}
+
+#[cfg(test)]
+#[test]
+fn retirement_uses_completed_fence_values() {
+    assert!(!fence_completed(4, 5));
+    assert!(fence_completed(5, 5));
+    assert!(fence_completed(6, 5));
+    assert!(!fence_completed(u64::MAX, 5));
+}
+
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -525,6 +584,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -585,6 +645,13 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        // A submitted fence value is only a target. A failed signal or
+        // wait can leave it pending when the CPU reaches this point.
+        // SAFETY: the queue's fence stays live for the host's lifetime.
+        if fence_completed(unsafe { self.fence.GetCompletedValue() }, *submitted) {
+            FINISHED.store(this_submission, Ordering::Release);
+            bury(this_submission);
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
