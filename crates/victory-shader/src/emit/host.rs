@@ -573,6 +573,16 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_in_slice(root, pso, d, None)
+    }
+
+    pub(super) fn draw_in_slice(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        slice: Option<u32>,
+    ) -> Result<Vec<[f32; 4]>, String> {
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -637,9 +647,13 @@ impl Host {
                 .map_err(err)?;
                 r.ok_or_else(|| "no resource".to_string())
             };
+            let mut target_desc = tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            if slice.is_some() {
+                target_desc.DepthOrArraySize = 2;
+            }
             let target = make(
                 D3D12_HEAP_TYPE_DEFAULT,
-                &tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                &target_desc,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 Some(&D3D12_CLEAR_VALUE {
                     Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
@@ -655,6 +669,9 @@ impl Host {
                 .map_err(err)?;
             let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
             dev.CreateRenderTargetView(&target, None, rtv);
+            if slice.is_some() {
+                list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            }
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -787,17 +804,31 @@ impl Host {
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
-            list.RSSetViewports(&[D3D12_VIEWPORT {
+            let mut viewport = D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
                 MaxDepth: 1.0,
                 ..Default::default()
-            }]);
-            list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+            };
+            let scissor = windows::Win32::Foundation::RECT {
                 right: w as i32,
                 bottom: h as i32,
                 ..Default::default()
-            }]);
+            };
+            if slice.is_some() {
+                viewport.Width /= 2.0;
+                list.RSSetViewports(&[
+                    viewport,
+                    D3D12_VIEWPORT {
+                        TopLeftX: viewport.Width,
+                        ..viewport
+                    },
+                ]);
+                list.RSSetScissorRects(&[scissor; 2]);
+            } else {
+                list.RSSetViewports(&[viewport]);
+                list.RSSetScissorRects(&[scissor]);
+            }
             list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             if let Some(vb) = &vb {
                 list.IASetVertexBuffers(
@@ -847,7 +878,7 @@ impl Host {
                 pResource: std::mem::transmute_copy(&target),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
+                    SubresourceIndex: slice.unwrap_or(0),
                 },
             };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);

@@ -956,7 +956,7 @@ const fn exp_inst(
 }
 
 #[test]
-fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
+fn vs_rt_and_viewport_index_exports_route_pixels() {
     use super::container::SigElement;
     use crate::dxbc::{Container, FourCC};
 
@@ -970,7 +970,7 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
         let native = NativeProgram {
             stage,
             wave64: false,
-            vgprs: 8,
+            vgprs: 12,
             layout,
             used: Vec::new(),
             io: stage_io,
@@ -987,7 +987,22 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
             st: &st,
             io: &io,
             res: &res,
-            inputs: Vec::new(),
+            inputs: if stage == HwStage::Vs {
+                vec![SigElement {
+                    name: "POSITION".into(),
+                    index: 0,
+                    kind: 0,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 0,
+                    half: false,
+                }]
+            } else {
+                Vec::new()
+            },
             outputs,
             prims: Vec::new(),
             mesh_stride: 0,
@@ -1002,9 +1017,14 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
             root_cbvs: lowered.root_cbvs,
             root_srvs: lowered.root_srvs,
         };
-        if let Ok(mut v) =
-            validator::Validator::load(validator::Validator::default_path().as_deref())
-        {
+        let validator = validator::Validator::load(validator::Validator::default_path().as_deref());
+        if std::env::var_os("VICTORY_DXIL").is_some() {
+            assert!(
+                validator.is_ok(),
+                "could not load the configured DXIL validator"
+            );
+        }
+        if let Ok(mut v) = validator {
             let mut copy = shader.dxil.clone();
             let ours = copy[4..20].to_vec();
             v.validate(&mut copy).expect("DXIL validation failed");
@@ -1056,14 +1076,10 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
     let mut vs_shaders = Vec::new();
     for (has_rt, has_vp, has_clip) in configs {
         let mut words = vec![
-            vop1(0x001, 0, 0x80),    // pos.x = 0.0
-            vop1(0x001, 1, 0x80),    // pos.y = 0.0
-            vop1(0x001, 2, 0x80),    // pos.z = 0.0
-            vop1(0x001, 3, 0xF2),    // pos.w = 1.0
             vop1(0x001, 4, sgpr(0)), // pos1.z = packed (viewport << 16) | rt
             vop1(0x001, 5, sgpr(1)), // pos2.x = clip distance
         ];
-        words.extend_from_slice(&exp_inst(12, 0xF, [0, 1, 2, 3], false, false)); // pos0
+        words.extend_from_slice(&exp_inst(12, 0xF, [8, 9, 10, 11], false, false)); // pos0
         words.extend_from_slice(&exp_inst(13, 0x4, [0, 0, 4, 0], !has_clip, false)); // pos1.z
         if has_clip {
             words.extend_from_slice(&exp_inst(14, 0x1, [5, 0, 0, 0], true, false)); // pos2.x
@@ -1140,7 +1156,12 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
                 slot: 0,
             }],
             StageIo::Vs {
-                inputs: Vec::new(),
+                inputs: vec![crate::native::VsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0xf,
+                    vgpr: 8,
+                }],
                 outputs: Vec::new(),
             },
             outputs,
@@ -1167,8 +1188,59 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
             continue;
         };
         for (i, vs) in vs_shaders.iter().enumerate() {
-            host.pipeline(vs, &ps)
+            let (root, pso) = host
+                .pipeline(vs, &ps)
                 .unwrap_or_else(|e| panic!("{label}: graphics pipeline case {i} failed: {e}"));
+            let (has_rt, has_vp, has_clip) = configs[i];
+            let k = [
+                u32::from(has_rt) | (u32::from(has_vp) << 16),
+                1.0f32.to_bits(),
+            ];
+            let mut user_data = vec![0; vs.user_data_dwords() as usize];
+            for u in &vs.user_data {
+                user_data[u.index as usize] = k[u.dword as usize];
+            }
+            let mut draw = super::host::Draw {
+                roots: vec![(0, Root::Constants(user_data))],
+                textures: &[],
+                samplers: &[],
+                vertices: &[
+                    -1.0, -1.0, 0.5, 1.0, -1.0, 3.0, 0.5, 1.0, 3.0, -1.0, 0.5, 1.0,
+                ],
+                stride: 16,
+                size: (8, 4),
+                mesh_groups: 0,
+            };
+            for layer in 0..2 {
+                let pixels = host.draw_in_slice(&root, &pso, &draw, Some(layer)).unwrap();
+                for (pixel, color) in pixels.into_iter().enumerate() {
+                    let wanted =
+                        if layer == u32::from(has_rt) && pixel % 8 / 4 == usize::from(has_vp) {
+                            [1.0, 0.0, 0.0, 1.0]
+                        } else {
+                            [0.0; 4]
+                        };
+                    assert_eq!(
+                        color, wanted,
+                        "{label} case {i}, layer {layer}, pixel {pixel}"
+                    );
+                }
+            }
+            if has_clip {
+                let Root::Constants(user_data) = &mut draw.roots[0].1 else {
+                    unreachable!();
+                };
+                for u in &vs.user_data {
+                    if u.dword == 1 {
+                        user_data[u.index as usize] = (-1.0f32).to_bits();
+                    }
+                }
+                let pixels = host.draw_in_slice(&root, &pso, &draw, Some(1)).unwrap();
+                assert!(
+                    pixels.iter().all(|pixel| *pixel == [0.0; 4]),
+                    "{label}: negative clip distance should clip the triangle"
+                );
+            }
         }
         ran += 1;
     }
