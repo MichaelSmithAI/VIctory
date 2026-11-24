@@ -1100,3 +1100,48 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
         assert!(e.contains(why), "{lanes_min}..{lanes_max}: {e}");
     }
 }
+
+/// LDS shared within one console wave with no barrier, as the console
+/// compiler leaves it: lane t writes 3t to dword t, then reads dword
+/// 63 - t (the other half's write), plus a lane read that needs the
+/// console flow. On a host without 64-lane waves the two halves run in
+/// lockstep only with a group barrier after each LDS access.
+#[test]
+fn lds_within_one_console_wave_reads_the_other_halfs_writes() {
+    let body = [
+        0x1602_0083, // v_mul_u32_u24 v1, 3, v0
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xD834_0000,
+        0x0000_0104, // ds_write_b32 v4, v1
+        0x4C0A_08FF,
+        252, // v_sub_nc_u32 v5, 252, v4
+        0xD8D8_0000,
+        0x0600_0005, // ds_read_b32 v6, v5
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4A04_0C09, // v_add_nc_u32 v2, s9, v6
+    ];
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let mut p = program(&body, 64);
+        // 512 bytes of LDS.
+        if let StageIo::Cs(io) = &mut p.io {
+            io.rsrc2 |= 1 << 15;
+        }
+        let groups = 2;
+        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let expect: Vec<u32> = (0..groups)
+            .flat_map(|_| (0..64).map(|t| 3 * (63 - t) + 40))
+            .collect();
+        let split = !host.target().runs(64);
+        assert_eq!(out, expect, "{name}: LDS across halves (split {split})");
+        eprintln!("{name}: LDS across halves exact (split {split})");
+    }
+}
