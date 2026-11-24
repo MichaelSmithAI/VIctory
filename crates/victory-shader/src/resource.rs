@@ -392,11 +392,17 @@ impl<'a> Tracer<'a> {
                     offset: 0,
                     dynamic: None,
                 },
-                Some((_, 0)) => Sum {
-                    base: Some(v),
-                    offset: 0,
-                    dynamic: None,
-                },
+                // The high half has already identified the pointer pair.
+                // Other constant parameters in this sum are numeric offsets.
+                Some((param, 0))
+                    if pair.is_none() || self.layout[param].root != RootType::Constants =>
+                {
+                    Sum {
+                        base: Some(v),
+                        offset: 0,
+                        dynamic: None,
+                    }
+                }
                 _ => dynamic,
             };
         }
@@ -1320,6 +1326,48 @@ mod tests {
         );
         assert_eq!((a.param, a.dword, a.offset), (0, 0, 0));
         assert!(a.dynamic.is_some());
+    }
+
+    #[test]
+    fn a_separate_root_constant_can_offset_a_root_constant_pair() {
+        // Assembled for GFX1030 wave32. s[0:1] is an address; s2 is a byte
+        // offset from a separate root parameter, with carry into the high half.
+        let words = [
+            0x7E00_0202, // v_mov_b32 v0, s2
+            0xD70F_6A02,
+            0x0202_0000, // v_add_co_u32 v2, vcc_lo, s0, v0
+            0xD528_6A03,
+            0x01A9_0001, // v_add_co_ci_u32 v3, vcc_lo, s1, 0, vcc_lo
+            0xDC30_8000,
+            0x017D_0002, // global_load_dword v1, v[2:3], off
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let resources = track(
+            &p,
+            &[param(Constants, 0, 2), param(Constants, 2, 1)],
+            HwStage::Cs,
+        )
+        .unwrap();
+        assert_eq!(
+            resources.pairs,
+            [Pair {
+                lo: (0, 0),
+                hi: (0, 1),
+            }]
+        );
+        let [(_, address)] = resources.scalar[..] else {
+            panic!("expected one tracked buffer read");
+        };
+        assert_eq!((address.param, address.dword, address.offset), (0, 0, 0));
+        let offset = p
+            .inputs
+            .iter()
+            .find(|(reg, _)| *reg == Reg::S(2))
+            .unwrap()
+            .1;
+        assert_eq!(address.dynamic, Some(offset));
     }
 
     #[test]
