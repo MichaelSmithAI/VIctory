@@ -347,6 +347,8 @@ pub struct Structured {
     pub masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    /// Scalar values read as masks, distinct from lane comparisons and EXEC.
+    other_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -356,6 +358,16 @@ pub struct Structured {
 }
 
 impl Structured {
+    pub(crate) fn uniform_mask_bits(&self, low: Value, high: Value) -> Option<Bool> {
+        let mask = *self.other_masks.get(&(low, high))?;
+        self.bools
+            .support(mask)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(_)))
+            .then_some(mask)
+    }
+
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -633,6 +645,7 @@ impl<'a> Lanes<'a> {
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            other_masks: self.other,
             active: self.active,
             bools: self.b,
             exits,
