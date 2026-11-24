@@ -333,25 +333,23 @@ impl State {
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
-        self.prepare_for(list, indexed, false)
+        self.prepare_for(list, indexed, false).is_ok()
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> Result<(), &'static str> {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return Err("pipeline filtered");
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return Err(HOST_PIPELINE_UNAVAILABLE);
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return Err("wrong host pipeline kind");
         }
-        if !self.bind(list, p, false) {
-            return false;
-        }
+        self.bind(list, p, false)?;
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -383,7 +381,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                return false;
+                return Err("index buffer outside title buffers");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -402,7 +400,7 @@ impl State {
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
         }
-        true
+        Ok(())
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -412,7 +410,7 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> Result<(), &'static str> {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -466,7 +464,7 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
-                return false;
+                return Err("no fresh descriptor table slots");
             }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
@@ -495,15 +493,13 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // An unset table is undefined: a null view instead.
-                        if tabled && !self.root_srv_table(list, None, param, compute) {
-                            return false;
+                        if tabled {
+                            self.root_srv_table(list, None, param, compute)?;
                         }
                         continue;
                     };
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute) {
-                            return false;
-                        }
+                        self.root_srv_table(list, Some(address), param, compute)?;
                         continue;
                     }
                     let Some(gpu) = root_view(list, address, srv) else {
@@ -521,21 +517,21 @@ impl State {
                 }
             }
         }
-        true
+        Ok(())
     }
 
     /// Binds a root SRV as a one-view table (see
     /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
     /// title buffer's host copy from `address` to the copy's end, or a null
     /// view (no address, or no host copy). One slot per address per list.
-    /// False if no dynamic slot could be had (the draw is dropped).
+    /// Returns a reason if the draw cannot bind the view.
     fn root_srv_table(
         &mut self,
         list: &HostList,
         address: Option<u64>,
         param: u32,
         compute: bool,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         let Some((heap, host)) = self
             .heaps
             .iter()
@@ -544,7 +540,7 @@ impl State {
             .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
         else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return Err("no bound view heap for bounded root SRV");
         };
         let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
@@ -552,7 +548,7 @@ impl State {
             Some(&index) => index,
             None => {
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return Err("no bounded root SRV descriptor slots");
                 };
                 self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots.insert(key, index);
@@ -590,7 +586,7 @@ impl State {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
-        true
+        Ok(())
     }
 
     /// Runs a dispatch on the host.
@@ -625,7 +621,7 @@ impl State {
             );
             return;
         }
-        if !self.bind(list, p, true) {
+        if self.bind(list, p, true).is_err() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -724,7 +720,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
+        let ran = self.prepare_for(list, false, true).is_ok()
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -1167,23 +1163,32 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+        let prepared = match kind {
+            DRAW | INDEXED if self.topology == RECTANGLES => Err("rectangle topology"),
+            DRAW | INDEXED => self.prepare_for(list, kind == INDEXED, false),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
+                Some(_) => Err("wrong host pipeline kind"),
+                None => Err(HOST_PIPELINE_UNAVAILABLE),
             },
-            _ => false,
+            _ => Err("unsupported indirect kind"),
         };
+        let pipeline_unavailable = prepared == Err(HOST_PIPELINE_UNAVAILABLE);
         #[cfg(feature = "diagnostics")]
-        self.frame_op("indirect", kind == DISPATCH, ran);
-        if !ran {
+        self.frame_op_why(
+            &format!("indirect kind {kind}"),
+            kind == DISPATCH,
+            prepared.is_ok(),
+            prepared.err().filter(|_| !pipeline_unavailable),
+        );
+        if let Err(reason) = prepared {
             crate::indirect::done(list, &args.buffer);
-            #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+            if pipeline_unavailable {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_drop(self.pipeline as This);
+            } else {
+                why(reason);
             }
             return false;
         }
@@ -1336,6 +1341,7 @@ fn describe(view: Option<&View>) -> String {
 }
 
 /// The console's own primitive topologies.
+const HOST_PIPELINE_UNAVAILABLE: &str = "host pipeline unavailable";
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
