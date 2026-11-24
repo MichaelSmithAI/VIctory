@@ -176,20 +176,9 @@ impl State {
 
     pub(crate) fn clear(&mut self, pipeline: This) {
         // Earlier draws can still read the dynamic slots owned by this list.
-        self.pipeline = pipeline as usize;
-        self.heaps = [0; 2];
-        self.graphics.clear();
-        self.compute.clear();
-        self.vertex = [VertexView::default(); 32];
-        self.index = IndexView::default();
-        self.targets.clear();
-        self.depth = 0;
-        self.topology = 0;
-        self.host_pipeline = 0;
-        self.host_roots = [0; 2];
-        self.host_heaps = [0; 2];
-        self.fresh_tables.clear();
-        self.table_failed = false;
+        let dynamic = std::mem::take(&mut self.dynamic);
+        self.reset(pipeline);
+        self.dynamic = dynamic;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -1284,6 +1273,7 @@ mod clear_state_tests {
             host_pipeline: 10,
             host_roots: [11, 12],
             host_heaps: [13, 14],
+            depth_bounds: Some((0.125, 0.875)),
             fresh_tables: [((4, 15), dynamic.1)].into(),
             dynamic: vec![dynamic],
             table_failed: true,
@@ -1310,6 +1300,7 @@ mod clear_state_tests {
         assert_eq!(state.host_pipeline, 0);
         assert_eq!(state.host_roots, [0; 2]);
         assert_eq!(state.host_heaps, [0; 2]);
+        assert_eq!(state.depth_bounds, None);
         assert!(state.fresh_tables.is_empty());
         assert!(!state.table_failed);
         assert_eq!(state.dynamic, [dynamic]);
