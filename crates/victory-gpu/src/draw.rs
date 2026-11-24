@@ -408,8 +408,7 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a table it reads could
-    /// not be made.
+    /// Returns the reason if a required table cannot be bound.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> Result<(), &'static str> {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
@@ -1180,7 +1179,13 @@ impl State {
         let pipeline_unavailable = prepared == Err(HOST_PIPELINE_UNAVAILABLE);
         #[cfg(feature = "diagnostics")]
         self.frame_op_why(
-            &format!("indirect kind {kind}"),
+            match kind {
+                DRAW => "indirect kind 0",
+                INDEXED => "indirect kind 1",
+                DISPATCH => "indirect kind 2",
+                MESH => "indirect kind 10",
+                _ => "unsupported indirect kind",
+            },
             kind == DISPATCH,
             prepared.is_ok(),
             prepared.err().filter(|_| !pipeline_unavailable),
@@ -1343,8 +1348,9 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
-/// The console's own primitive topologies.
 const HOST_PIPELINE_UNAVAILABLE: &str = "host pipeline unavailable";
+
+/// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
