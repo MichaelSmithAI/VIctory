@@ -79,9 +79,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     budget.InterlockedAdd(0, cost, before);
     if (before >= BUDGET || before + cost > BUDGET) {
         // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+        // A scaled dispatch's host work is what is declined: its record,
+        // not the title's.
         if (kind == 2 && waves > 1) {
             scaled.Store(id.x * 12, 0);
+        } else {
+            args.Store(at, 0);
         }
     }
 }
@@ -267,5 +270,42 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// Records of a shader run as two host groups per console group whose
+    /// host work is declined (x times 2 past 65,535; the list's budget
+    /// spent): the clamp alone, nothing executed. The title's records keep
+    /// their counts in the host copy; only the scaled records run empty.
+    #[test]
+    fn declined_scaled_records_leave_the_titles_records_alone() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if super::clamp().is_none() {
+            return;
+        }
+        // Record 0: x * 2 past 65,535. Records 1 and 2: 32,767 x 32 console
+        // groups of two 64-thread host groups, 2^27 - 4,096 threads each:
+        // together past the list's budget of 2^27, so whichever the clamp
+        // reaches second is declined.
+        let records: [[u32; 3]; 3] = [[40_000, 1, 1], [32_767, 32, 1], [32_767, 32, 1]];
+        let mut title = Box::new([0u32; 16]);
+        for (n, r) in records.iter().enumerate() {
+            title[n * 3..n * 3 + 3].copy_from_slice(r);
+        }
+        let at = title.as_mut_ptr() as u64;
+        crate::shadow::register(at as usize, at, 64);
+        let shadow = crate::shadow::find(at, 36).unwrap();
+        let list = host.new_list().expect("new_list");
+        let scaled = list.rect_args(36).expect("scaled records");
+        shadow.refresh(&list, at, 36);
+        // SAFETY: a live buffer of the list's.
+        let to = unsafe { scaled.GetGPUVirtualAddress() };
+        assert!(super::clamp_scaled(&list, shadow.gpu(at), (2, 12, 3), 2, Some(to)));
+        list.close();
+        host.execute(&[&list]);
+        let copy: Vec<u32> = (0..9).map(|w| shadow.read_u32(w * 4)).collect();
+        assert_eq!(copy, records.concat(), "the title's records in the host copy");
+        crate::shadow::unregister(at as usize, at);
     }
 }
