@@ -1109,10 +1109,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
-        && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
-    {
+    // In the copy the view was made on, not a nested buffer's.
+    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_shadow(view) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
