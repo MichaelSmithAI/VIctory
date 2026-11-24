@@ -416,7 +416,7 @@ impl HostHeap {
         let view = view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
-            let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
+            let host = buffer_shadow(&view).map(|(s, _, _)| s.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
@@ -499,6 +499,37 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
     ))
+}
+
+/// The title memory whose host copy a buffer view is made on (see
+/// [`make`]): the viewed buffer's address and length. A view's
+/// [`buffer_range`] is refreshed in this copy, not in that of a narrower
+/// buffer placed inside it (the world's 174 MB block holds several), or of
+/// a narrower window of loose memory, which [`crate::shadow::find`] would
+/// give for the range alone.
+fn buffer_copy(view: &View) -> Option<(u64, u64)> {
+    match view {
+        View::Shader(r, Some(_)) | View::Unordered(r, _, Some(_)) => {
+            let (data, len) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            Some((data as u64, len))
+        }
+        View::Placed(_, resource, desc) if resource[0] == 1 => Some((
+            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+        )),
+        _ => None,
+    }
+}
+
+/// A buffer view's [`buffer_range`] in the host copy the view is made on,
+/// cut to the copy; none for a range starting past its end (no slot is
+/// made for it).
+pub(crate) fn buffer_shadow(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    let (address, len) = buffer_range(view)?;
+    let (base, width) = buffer_copy(view)?;
+    let shadow = crate::shadow::find(base, width)?;
+    let len = len.min(shadow.left(address));
+    (len > 0).then_some((shadow, address, len))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -948,6 +979,45 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view of a buffer that holds a narrower buffer placed inside it (the
+    /// world's 174 MB block) is refreshed in the copy its slot is made on,
+    /// not in the narrower buffer's copy, which the shader never reads.
+    #[test]
+    fn views_over_nested_buffers_refresh_the_copy_they_are_made_on() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Title buffers only (their copies are made on the host; title
+        // memory is not read): an outer one and one placed inside it.
+        let (outer, outer_len) = (0x7d00_0000_0000_u64, 0x2_0000_u64);
+        let (inner, inner_len) = (outer + 0x1_0000, 0x1000_u64);
+        crate::shadow::register(usize::MAX - 2, outer, outer_len);
+        crate::shadow::register(usize::MAX - 3, inner, inner_len);
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // a buffer
+        resource[4] = outer_len as u32;
+        // A structured view of the outer buffer, 16 elements of 16 bytes,
+        // whose bytes lie inside the inner one.
+        let mut desc = [0u32; 16];
+        desc[1] = 1; // buffer dimension
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[4] = ((inner - outer) / 16) as u32; // FirstElement
+        (desc[6], desc[7]) = (16, 16); // NumElements, StructureByteStride
+        (desc[10], desc[11]) = (outer as u32, (outer >> 32) as u32);
+        let view = View::Placed(false, resource, desc);
+        heap.make_at(0, &view);
+        let made = heap.kept.lock().unwrap()[0].clone();
+        let made = made.expect("the view's slot is made");
+        let (shadow, address, len) = buffer_shadow(&view).expect("a buffer view");
+        assert_eq!((address, len), (inner, 256));
+        // The layout matters: the range alone finds the inner copy.
+        let narrow = crate::shadow::find(address, len).expect("the inner copy");
+        assert!(narrow.buffer != made, "the range alone finds the inner copy");
+        assert!(shadow.buffer == made, "refreshed in the copy the slot views");
+        crate::shadow::unregister(usize::MAX - 3, inner);
+        crate::shadow::unregister(usize::MAX - 2, outer);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
