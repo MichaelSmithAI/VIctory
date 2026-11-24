@@ -6881,6 +6881,74 @@ mod tests {
     }
 
     #[test]
+    fn spilled_root_uav_matches_direct_root_uav() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+
+        let store = [
+            0x7E00_0280, // v_mov_b32 v0, 0 (offset)
+            0x7E02_0291, // v_mov_b32 v1, 17 (stored value)
+            0xDC70_8000, // global_store_dword v0, v1, s[4:5]
+            0x0004_0100,
+            S_ENDPGM,
+        ];
+        let make = |prefix: &[u32], user_data: u8, spilled| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 2,
+                    user_data,
+                    slot: 2,
+                }],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 2,
+                    user_data,
+                    slot: 2,
+                }],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: (u32::from(user_data) + 2) << 1,
+                    threads: [1, 1, 1],
+                }),
+                code: prefix
+                    .iter()
+                    .chain(&store)
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect(),
+            };
+            let p = ir::build_with(&native.code, false, 8, spilled).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+
+        let direct = make(&[0xBE84_0314, 0xBE85_0315], 20, false).unwrap(); // s4 <- s20, s5 <- s21
+        let spilled = make(&[0xF404_0100, 0xFA00_0010], 20, true).unwrap(); // s_load_dwordx2 s[4:5], s[0:1], 0x10
+        assert_eq!(direct.root_uavs, [2]);
+        assert_eq!(spilled.root_uavs, [2]);
+        assert_eq!(spilled.dxil, direct.dxil);
+    }
+
+    #[test]
     fn a_scalar_carry_chain_reaches_the_select() {
         // The high dword of a 64-bit add or subtract, then a select on the
         // carry (borrow) the high half leaves in SCC, and a branch on it
