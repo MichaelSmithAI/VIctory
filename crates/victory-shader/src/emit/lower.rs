@@ -89,6 +89,11 @@ pub(crate) struct Parts<'a> {
 ///   it keeps the per-lane form ([`Parts::per_lane_only`]).
 pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange lanes (console flow)";
 
+/// Why the console flow ([`CONSOLE_FLOW`]) refuses a descriptor each lane
+/// holds by the path it took ([`Source::LanePhi`]).
+pub(crate) const LANE_PHI_IN_CONSOLE_FLOW: &str =
+    "a per-lane descriptor chosen by control flow in the console flow";
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -3908,6 +3913,13 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.select(self.cur, cond, set, clear))
             }
             Source::LanePhi { block, args } => {
+                // In the console flow every lane comes to the join by the
+                // edge the wave took, not by its own: the edge does not say
+                // which descriptor the lane holds. The program keeps the
+                // per-lane form where that translates.
+                if self.console_cf {
+                    return Err(LANE_PHI_IN_CONSOLE_FLOW);
+                }
                 // Each predecessor computes its heap index at its end (what
                 // it reads is there: the dwords are, on that edge); the join
                 // picks the one of the edge the lane came by. An edge no
