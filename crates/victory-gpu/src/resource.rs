@@ -1454,6 +1454,46 @@ mod tests {
         clear_float(list, base + 192, base + 64, buffers[1], &[1.25; 4], 0, null.cast());
         clear_float(list, base + 224, base + 96, buffers[1], &[-2.5; 4], 0, null.cast());
         let host_list = crate::list::host_list(list).unwrap();
+        let mut image = null;
+        let desc = texture(2, 1, 28, 1);
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let layout = PlacedFootprint {
+            offset: 4 * 4, format: 28, width: 5, height: 1, depth: 1, row_pitch: 256,
+        };
+        let from = Location { resource: buffers[0], kind: 1, footprint: layout };
+        let to = Location { resource: image, kind: 0, footprint: NO_FOOTPRINT };
+        let mut to = to;
+        to.footprint.offset = 0;
+        type CopyTexture = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const [u32; 6]);
+        slot::<CopyTexture>(list, 0x80)(list, &to, 0, 0, 0, &from, &[0, 0, 0, 2, 1, 1]);
+        let (pixels, mapped_pixels) = host.shared_buffer(256).expect("texture readback");
+        crate::list::ensure_state(host_list, image, 0x800);
+        use windows::core::Interface;
+        let image_location = Location {
+            resource: host_resource(image).unwrap().as_raw().cast_const().cast(),
+            ..to
+        };
+        let pixel_location = Location {
+            resource: pixels.as_raw().cast_const().cast(),
+            kind: 1,
+            footprint: PlacedFootprint { offset: 0, width: 2, ..layout },
+        };
+        // SAFETY: the image and buffer are live and the copy fits their backing.
+        unsafe {
+            host_list.list.CopyTextureRegion(
+                (&raw const pixel_location).cast(), 0, 0, 0,
+                (&raw const image_location).cast(), None,
+            );
+        }
         let (readback, mapped) = host.shared_buffer(512).expect("GPU copy destination");
         for (index, resource) in buffers.into_iter().enumerate() {
             let (data, len) = buffer_bytes(resource).unwrap();
@@ -1473,6 +1513,12 @@ mod tests {
         host.execute(&[crate::list::host_list(list).unwrap()]);
         slot::<Release>(list, 0x10)(list);
         slot::<Release>(allocator, 0x10)(allocator);
+
+        // SAFETY: the completed GPU copy wrote both words to this live mapping.
+        let pixel_words = unsafe { mapped_pixels.cast::<[u32; 2]>().read_unaligned() };
+        eprintln!("same-list guest texture copy: {pixel_words:x?}");
+        assert_eq!(pixel_words, [17, 31]);
+        slot::<Release>(image, 0x10)(image);
 
         for (index, (resource, (first, second))) in buffers.into_iter()
             .zip([(17, 31), (1.25f32.to_bits(), (-2.5f32).to_bits())]).enumerate()

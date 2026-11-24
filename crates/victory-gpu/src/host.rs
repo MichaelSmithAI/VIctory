@@ -1515,12 +1515,19 @@ impl HostList {
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
         let end = address.checked_add(len)?;
         let overlaps = |at: usize, size: usize| size != 0 && at < end && address < at + size;
+        let mut newest = None;
         for step in self.deferred().copies.iter().rev() {
             match step {
                 Step::GpuWrite(shadow, at, size) if overlaps(*at, *size) => {
-                    // A partial producer still needs the copy's CPU snapshot
-                    // for bytes that subsequent refreshes can overwrite.
-                    return (*at <= address && end <= at + size).then(|| shadow.clone());
+                    // A newer partial write can overlay a full producer in
+                    // the same copy. Separate shadows cannot share the bytes.
+                    if newest.is_some_and(|other| !std::sync::Arc::ptr_eq(other, shadow)) {
+                        return None;
+                    }
+                    if *at <= address && end <= at + size {
+                        return Some(shadow.clone());
+                    }
+                    newest = Some(shadow);
                 }
                 Step::Copy(dst, _, size) if overlaps(*dst, *size) => return None,
                 // Raw deferred CPU work can write this range too.
