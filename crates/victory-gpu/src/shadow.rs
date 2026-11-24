@@ -202,7 +202,9 @@ impl Shadow {
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
+            // Keep the existing page epochs. A write-watch query after the
+            // copy would also collect title writes made after we read a page.
+            // The next refresh queries before copying and can consume both.
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -227,25 +229,11 @@ impl Shadow {
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
-            // Pages made equal to title memory are current in the copy, so
-            // our own write is not taken for the title's; others keep what
-            // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
-                }
-            }
+            #[cfg(test)]
+            copyback_tests::after_pages();
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
@@ -496,4 +484,83 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod copyback_tests {
+    use super::*;
+    use std::cell::Cell;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+        PAGE_READWRITE, UnmapViewOfFile,
+    };
+
+    thread_local! {
+        static LATE_WRITE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn after_pages() {
+        let address = LATE_WRITE.with(|slot| slot.replace(0));
+        if address != 0 {
+            // SAFETY: the test owns this mapped byte for the call.
+            unsafe { (address as *mut u8).write_volatile(7) };
+        }
+    }
+
+    struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+
+    impl Drop for View {
+        fn drop(&mut self) {
+            let base = self.0.Value as usize;
+            // SAFETY: the view and tracking entry belong to this test.
+            unsafe { UnmapViewOfFile(self.0) };
+            crate::watch::title_memory_remapped(base, 2 * PAGE);
+        }
+    }
+
+    #[test]
+    fn title_write_after_copy_back_page_reaches_next_refresh() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("copyback freshness skipped: no D3D12 device");
+            return;
+        };
+        // SAFETY: pagefile-backed mapping, initially read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * PAGE) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let mapped = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE);
+            CloseHandle(section);
+            assert!(!mapped.Value.is_null());
+            View(mapped)
+        };
+        let base = view.0.Value as usize;
+        let (buffer, data) = host.shared_buffer((2 * PAGE) as u64).unwrap();
+        // SAFETY: the buffer is live.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, base as u64, (2 * PAGE) as u64);
+
+        assert_eq!(shadow.update(base, 2 * PAGE), 2 * PAGE);
+        shadow.writing(base, PAGE);
+        // SAFETY: simulate one completed GPU write in the mapped host copy.
+        unsafe { data.write(1) };
+        LATE_WRITE.with(|slot| slot.set(base + 8));
+        assert_eq!(shadow.copy_back(base, PAGE), PAGE);
+
+        // SAFETY: the view and host buffer are live.
+        assert_eq!(unsafe { (base as *const u8).read_volatile() }, 1);
+        assert_eq!(unsafe { ((base + 8) as *const u8).read_volatile() }, 7);
+        assert_eq!(shadow.update(base + PAGE, PAGE), 0, "unchanged control");
+        assert_eq!(shadow.update(base, PAGE), PAGE, "refreshed late write");
+        assert_eq!(unsafe { data.add(8).read() }, 7);
+        assert_eq!(shadow.update(base, PAGE), 0, "now clean");
+        eprintln!("copyback late-write refresh completed");
+    }
 }
