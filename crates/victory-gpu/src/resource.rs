@@ -1394,6 +1394,77 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn copied_title_descriptors_resync_at_submission() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let make = |desc| {
+            let mut out = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            out
+        };
+        let first = make(texture(4, 4, 28, 1));
+        let second = make(texture(4, 4, 28, 1));
+        let constants = make(buffer(256));
+        let (bytes, _) = buffer_bytes(constants).unwrap();
+        // SAFETY: ordinary committed guest memory, tracked by write-watch.
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE)
+        };
+        assert!(!memory.is_null());
+        let start = memory as u64;
+        #[repr(C)]
+        struct Extended([u32; 4], [u64; 2]);
+        let ext = Extended([0, 8, 1, 1], [start, 8 * 32]);
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(null, std::ptr::from_ref(&ext).cast(), &PAGEABLE_IIDS[0], &mut heap),
+            S_OK
+        );
+        crate::descriptor::create_srv(null, first, std::ptr::null(), start);
+        crate::descriptor::create_srv(null, second, std::ptr::null(), start + 32);
+        let cbv = [bytes as u32, ((bytes as u64) >> 32) as u32, 256, 0];
+        crate::descriptor::create_cbv(null, &cbv, start + 64);
+        let heap_host = crate::descriptor::heap(heap).host().unwrap();
+        let is_resource = |index, guest| {
+            heap_host.test_resource(index).as_ref() == host_resource(guest)
+        };
+        assert!(is_resource(0, first));
+        assert!(is_resource(1, second));
+        crate::descriptor::resync_title_writes();
+
+        // SAFETY: copy two initialized records wholly within the live title heap.
+        unsafe { std::ptr::copy_nonoverlapping(memory.cast::<u8>().add(32), memory.cast(), 32) };
+        assert!(is_resource(0, first));
+        crate::descriptor::resync_title_writes();
+        assert!(is_resource(0, second));
+
+        // SAFETY: same heap, disjoint full slots.
+        unsafe { std::ptr::copy_nonoverlapping(memory.cast::<u8>().add(64), memory.cast(), 32) };
+        crate::descriptor::resync_title_writes();
+        assert!(matches!(crate::descriptor::view(start), Some(crate::descriptor::View::Constant(..))));
+        assert!(heap_host.test_resource(0).is_none(), "sweep defers buffer descriptors");
+        // A draw's explicit materialization path can make this same valid CBV.
+        heap_host.mirror(0, start, true);
+        assert!(heap_host.test_resource(0).is_some());
+
+        for object in [heap, first, second, constants] {
+            assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+        }
+        // SAFETY: the heap was released and no object retains the guest records.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,

@@ -378,6 +378,11 @@ impl HostHeap {
         Some(view)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_resource(&self, index: usize) -> Option<ID3D12Resource> {
+        self.kept.lock().unwrap()[index].clone()
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
