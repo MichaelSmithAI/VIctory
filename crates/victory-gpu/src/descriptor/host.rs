@@ -605,6 +605,14 @@ fn fits(d: &D3D12_RESOURCE_DESC, mut format: Option<&mut DXGI_FORMAT>, unordered
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
+        if !unordered
+            && d.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS
+            && let Some(format) = format
+        {
+            // The explicit SRV still supplies the view dimension and mip range.
+            *format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            return true;
+        }
         return !typeless;
     }
     if family(view) != family(own) {
@@ -1093,6 +1101,13 @@ mod tests {
     #[cfg(feature = "diagnostics")]
     #[test]
     fn typeless_rgba8_uav_clear_is_read_through_the_remapped_srv() {
+        for request in [DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_UNKNOWN] {
+            read_typeless_rgba8_through_srv(request);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn read_typeless_rgba8_through_srv(request: DXGI_FORMAT) {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::core::s;
@@ -1150,11 +1165,11 @@ mod tests {
         let info = unsafe { texture.GetDesc() };
         assert!(fits(&info, Some(&mut format), true));
         assert_eq!(format, DXGI_FORMAT_R8G8B8A8_UNORM);
-        let mut srv_format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        let mut srv_format = request;
         assert!(fits(&info, Some(&mut srv_format), false));
         assert_eq!(srv_format, DXGI_FORMAT_R8G8B8A8_UNORM);
         let mut srv_words = [0; 10];
-        srv_words[0] = DXGI_FORMAT_R8G8B8A8_TYPELESS.0 as u32;
+        srv_words[0] = request.0 as u32;
         srv_words[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
         srv_words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         let mip_levels = (std::mem::offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, Anonymous)
