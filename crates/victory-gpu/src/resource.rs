@@ -331,6 +331,32 @@ impl PlacedFootprint {
         let last = u64::from(self.width).div_ceil(block) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
+
+    /// The byte span enclosing the rows and slices read by a source box.
+    pub(crate) fn box_bytes(
+        &self,
+        [left, top, front, right, bottom, back]: [u32; 6],
+    ) -> Option<std::ops::Range<u64>> {
+        if left >= right
+            || top >= bottom
+            || front >= back
+            || right > self.width
+            || bottom > self.height
+            || back > self.depth
+        {
+            return None;
+        }
+        let (element, block) = element(self.format)?;
+        let pitch = u64::from(self.row_pitch);
+        let slice = pitch * u64::from(self.height).div_ceil(block);
+        let start = u64::from(front) * slice
+            + u64::from(top) / block * pitch
+            + u64::from(left) / block * element;
+        let end = u64::from(back - 1) * slice
+            + (u64::from(bottom).div_ceil(block) - 1) * pitch
+            + u64::from(right).div_ceil(block) * element;
+        Some(start..end)
+    }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
 
@@ -1366,6 +1392,156 @@ mod tests {
         visible_nodes: 0,
     };
 
+    #[cfg(windows)]
+    #[test]
+    fn resource_backed_buffer_uav_clears_update_only_the_view() {
+        let host = crate::host::host().expect("a host GPU");
+        let null = std::ptr::null();
+        const SENTINEL: u32 = 0x7a91234d;
+        let mut buffers = [null; 2];
+        for resource in &mut buffers {
+            let mut desc = buffer(256);
+            desc.flags = 4;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], resource),
+                S_OK
+            );
+            let (data, _) = buffer_bytes(*resource).unwrap();
+            // SAFETY: the committed allocation contains 64 aligned dwords.
+            unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), 64) }.fill(SENTINEL);
+        }
+
+        // The guest's CPU and shader-visible handles hold the same view.
+        #[repr(C)]
+        struct Extended([u32; 4], [u64; 2]);
+        let mut memory = [0u64; 32];
+        let base = memory.as_mut_ptr() as u64;
+        let mut heaps = [null; 2];
+        for (i, flags) in [0, 1].into_iter().enumerate() {
+            let extension = Extended([0, 4, flags, 1], [base + i as u64 * 128, 128]);
+            assert_eq!(
+                crate::descriptor::create_heap(null, std::ptr::from_ref(&extension).cast(), &PAGEABLE_IIDS[0], &mut heaps[i]),
+                S_OK
+            );
+        }
+        for (i, (resource, format)) in buffers.into_iter().zip([42, 41]).enumerate() {
+            // Clear elements 3..8 and later overwrite just elements 5..7.
+            for (j, (first, count)) in [(3, 5), (5, 2)].into_iter().enumerate() {
+                let words = [format, 1, first, 0, count, 0, 0, 0, 0, 0];
+                let slot = (i * 2 + j) as u64 * 32;
+                crate::descriptor::create_uav(null, resource, null, &words, base + slot);
+                crate::descriptor::create_uav(null, resource, null, &words, base + 128 + slot);
+            }
+        }
+
+        let allocator_iid = guid(
+            0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(list, 0x100)(list, 1, &heaps[1]);
+        type Clear<T> = extern "system" fn(This, u64, u64, This, *const [T; 4], u32, *const c_void);
+        let clear_uint = slot::<Clear<u32>>(list, 0x1a8);
+        clear_uint(list, base + 128, base, buffers[0], &[17; 4], 0, null.cast());
+        clear_uint(list, base + 160, base + 32, buffers[0], &[31; 4], 0, null.cast());
+        let clear_float = slot::<Clear<f32>>(list, 0x1b0);
+        clear_float(list, base + 192, base + 64, buffers[1], &[1.25; 4], 0, null.cast());
+        clear_float(list, base + 224, base + 96, buffers[1], &[-2.5; 4], 0, null.cast());
+        let host_list = crate::list::host_list(list).unwrap();
+        let mut image = null;
+        let desc = texture(2, 1, 28, 1);
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let layout = PlacedFootprint {
+            offset: 4 * 4, format: 28, width: 5, height: 1, depth: 1, row_pitch: 256,
+        };
+        let from = Location { resource: buffers[0], kind: 1, footprint: layout };
+        let to = Location { resource: image, kind: 0, footprint: NO_FOOTPRINT };
+        let mut to = to;
+        to.footprint.offset = 0;
+        type CopyTexture = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const [u32; 6]);
+        slot::<CopyTexture>(list, 0x80)(list, &to, 0, 0, 0, &from, &[0, 0, 0, 2, 1, 1]);
+        let (pixels, mapped_pixels) = host.shared_buffer(256).expect("texture readback");
+        crate::list::ensure_state(host_list, image, 0x800);
+        use windows::core::Interface;
+        let image_location = Location {
+            resource: host_resource(image).unwrap().as_raw().cast_const().cast(),
+            ..to
+        };
+        let pixel_location = Location {
+            resource: pixels.as_raw().cast_const().cast(),
+            kind: 1,
+            footprint: PlacedFootprint { offset: 0, width: 2, ..layout },
+        };
+        // SAFETY: the image and buffer are live and the copy fits their backing.
+        unsafe {
+            host_list.list.CopyTextureRegion(
+                (&raw const pixel_location).cast(), 0, 0, 0,
+                (&raw const image_location).cast(), None,
+            );
+        }
+        let (readback, mapped) = host.shared_buffer(512).expect("GPU copy destination");
+        for (index, resource) in buffers.into_iter().enumerate() {
+            let (data, len) = buffer_bytes(resource).unwrap();
+            let base = data as u64;
+            let shadow = crate::shadow::find(base, len).unwrap();
+            shadow.refresh(host_list, base, len);
+            host_list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+            // SAFETY: live buffers, a tracked COPY_SOURCE and a common-state
+            // destination eligible for promotion. Both copy regions fit.
+            unsafe {
+                host_list.list.CopyBufferRegion(
+                    &readback, index as u64 * 256, &shadow.buffer, shadow.offset(base), 256,
+                );
+            }
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        host.execute(&[crate::list::host_list(list).unwrap()]);
+        slot::<Release>(list, 0x10)(list);
+        slot::<Release>(allocator, 0x10)(allocator);
+
+        // SAFETY: the completed GPU copy wrote both words to this live mapping.
+        let pixel_words = unsafe { mapped_pixels.cast::<[u32; 2]>().read_unaligned() };
+        eprintln!("same-list guest texture copy: {pixel_words:x?}");
+        assert_eq!(pixel_words, [17, 31]);
+        slot::<Release>(image, 0x10)(image);
+
+        for (index, (resource, (first, second))) in buffers.into_iter()
+            .zip([(17, 31), (1.25f32.to_bits(), (-2.5f32).to_bits())]).enumerate()
+        {
+            let mut expected = [SENTINEL; 64];
+            expected[3..8].fill(first);
+            expected[5..7].fill(second);
+            let (data, _) = buffer_bytes(resource).unwrap();
+            // SAFETY: the completed list no longer writes the live allocation.
+            let actual = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 64) };
+            eprintln!("clear fixture {index} words: {:?}", &actual[..9]);
+            // SAFETY: the submitted copies have completed, and each slice
+            // lies within the 512 bytes of mapped GPU copy destination.
+            let copied = unsafe { std::slice::from_raw_parts(mapped.cast::<u32>().add(index * 64), 64) };
+            assert_eq!(actual, expected, "guest copyback");
+            assert_eq!(copied, expected, "same-list GPU copy after clear");
+            slot::<Release>(resource, 0x10)(resource);
+        }
+        for heap in heaps {
+            slot::<Release>(heap, 0x10)(heap);
+        }
+    }
+
     fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {
             dimension: BUFFER,
@@ -1558,6 +1734,29 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[test]
+    fn boxed_footprints_cover_block_rows_and_volume_slices() {
+        let compressed = PlacedFootprint {
+            offset: 512,
+            format: 71,
+            width: 10,
+            height: 9,
+            depth: 1,
+            row_pitch: 256,
+        };
+        assert_eq!(compressed.box_bytes([4, 4, 0, 10, 9, 1]), Some(264..536));
+
+        let volume = PlacedFootprint {
+            offset: 512,
+            format: 28,
+            width: 4,
+            height: 3,
+            depth: 3,
+            row_pitch: 256,
+        };
+        assert_eq!(volume.box_bytes([1, 1, 1, 3, 3, 3]), Some(1028..2060));
     }
 
     #[test]

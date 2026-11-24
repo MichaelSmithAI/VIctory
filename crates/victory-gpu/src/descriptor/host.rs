@@ -278,6 +278,53 @@ impl HostHeap {
         }
     }
 
+    /// Makes a matched native UAV pair from the CPU view. The GPU slot is
+    /// held until list reset like the descriptors in a fresh table.
+    pub(crate) fn clear_texture_uav(
+        &self,
+        list: &crate::host::HostList,
+        texture: &ID3D12Resource,
+        words: Option<&[u32; 10]>,
+    ) -> Option<(u32, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE)> {
+        let mut desc = words.map(uav_desc);
+        if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            return None;
+        }
+        self.clear_uav_pair(list, texture, desc.as_ref())
+    }
+
+    pub(crate) fn clear_uav_pair(
+        &self,
+        list: &crate::host::HostList,
+        resource: &ID3D12Resource,
+        desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    ) -> Option<(u32, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE)> {
+        let device = &host()?.device;
+        let cpu = list.clear_uav_cpu()?;
+        let slot = self.dynamic(1)?;
+        // SAFETY: both handles name live heap slots. Copy from the
+        // CPU-only heap to the shader-visible heap.
+        let gpu = unsafe {
+            device.CreateUnorderedAccessView(
+                resource,
+                None::<&ID3D12Resource>,
+                desc.map(std::ptr::from_ref),
+                cpu,
+            );
+            device.CopyDescriptorsSimple(
+                1, self.cpu(slot), cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: self.heap.GetGPUDescriptorHandleForHeapStart().ptr
+                    + u64::from(slot) * u64::from(self.step),
+            }
+        };
+        // The list's resource states retain the resource through execution.
+        self.keep(slot, None);
+        Some((slot, gpu, cpu))
+    }
+
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
@@ -480,13 +527,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::element(desc.Format.0 as u32)?.0
-    };
+    let element = unordered_element(desc.Format, &buffer)?;
     Some((
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
@@ -533,10 +574,25 @@ fn buffer_srv(
 fn buffer_uav(
     address: u64,
     len: u64,
-    mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
+    let desc = shadow_uav_desc(&shadow, address, desc)?;
+    let host = host()?;
+    // SAFETY: a live buffer and a slot of our heap.
+    unsafe {
+        host.device
+            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+    };
+    Some(Some(shadow.buffer.clone()))
+}
+
+fn shadow_uav_desc(
+    shadow: &crate::shadow::Shadow,
+    address: u64,
+    mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -545,13 +601,7 @@ fn buffer_uav(
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-    };
+    let element = unordered_element(desc.Format, buffer).unwrap_or(0);
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
         once!(offset, element, "unordered buffer view not on an element of its host copy");
@@ -559,13 +609,57 @@ fn buffer_uav(
     }
     buffer.FirstElement += offset / element;
     buffer.CounterOffsetInBytes = 0;
-    let host = host()?;
-    // SAFETY: a live buffer and a slot of our heap.
-    unsafe {
-        host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
-    };
-    Some(Some(shadow.buffer.clone()))
+    Some(desc)
+}
+
+fn unordered_element(format: DXGI_FORMAT, buffer: &D3D12_BUFFER_UAV) -> Option<u64> {
+    if buffer.StructureByteStride > 0 {
+        Some(u64::from(buffer.StructureByteStride))
+    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        Some(4)
+    } else {
+        crate::resource::element(format.0 as u32).map(|(bytes, _)| bytes)
+    }
+}
+
+pub(crate) struct BufferClearView {
+    pub(crate) shadow: std::sync::Arc<crate::shadow::Shadow>,
+    pub(crate) desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    pub(crate) address: u64,
+    pub(crate) len: u64,
+}
+
+/// Resolves a typed buffer view and its copy-back range on the same shadow.
+/// The descriptor's displacement is relative to the full resource.
+pub(crate) fn buffer_clear_view(
+    resource: crate::object::This,
+    words: &[u32; 10],
+) -> Option<BufferClearView> {
+    let (data, size) = crate::resource::buffer_bytes(resource)?;
+    let desc = uav_desc(words);
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: checked the union's dimension.
+    let view = unsafe { desc.Anonymous.Buffer };
+    if view.StructureByteStride != 0 || view.Flags != D3D12_BUFFER_UAV_FLAG_NONE {
+        return None;
+    }
+    let element = unordered_element(desc.Format, &view)?;
+    let start = view.FirstElement.checked_mul(element)?;
+    let len = u64::from(view.NumElements).checked_mul(element)?;
+    if len == 0 || start.checked_add(len)? > size {
+        return None;
+    }
+    let base = data as u64;
+    let shadow = crate::shadow::find(base, size)?;
+    let desc = shadow_uav_desc(&shadow, base, desc)?;
+    Some(BufferClearView {
+        shadow,
+        desc,
+        address: base + start,
+        len,
+    })
 }
 
 /// Whether the host can make a shader (or unordered access) view of

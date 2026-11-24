@@ -51,6 +51,12 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+pub(crate) enum UavClear {
+    Uint([u32; 4]),
+    Float([f32; 4]),
+}
+
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -144,6 +150,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -371,6 +378,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -389,6 +398,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -408,14 +418,8 @@ impl State {
         true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
-    /// What draws and dispatches share: heaps, our root signature, the
-    /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a table it reads could
-    /// not be made.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    /// Binds the title's shader-visible heaps when they change.
+    fn bind_heaps(&mut self, list: &HostList) {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -433,6 +437,83 @@ impl State {
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
+    }
+
+    /// Records a clear of a resource-backed texture or typed buffer UAV.
+    pub(crate) fn clear_uav(
+        &mut self,
+        list: &HostList,
+        gpu: u64,
+        cpu: u64,
+        resource: This,
+        value: UavClear,
+        rects: &[RECT],
+    ) {
+        let heap_id = self.heaps[0];
+        if heap_id == 0 {
+            return;
+        }
+        let heap = crate::descriptor::heap(heap_id as This);
+        if heap.index(gpu).is_none() {
+            return;
+        }
+        let Some(view @ View::Unordered(backing, counter, words)) = crate::descriptor::view(cpu) else {
+            return;
+        };
+        if backing != resource as usize || crate::descriptor::view(gpu) != Some(view) {
+            return;
+        }
+        let Some(native_heap) = heap.host() else { return };
+        let host_texture = crate::resource::host_resource(resource);
+        let buffer = if host_texture.is_none() && counter == 0 {
+            words.as_ref()
+                .and_then(|words| crate::descriptor::host::buffer_clear_view(resource, words))
+        } else {
+            None
+        };
+        let (native_resource, pair) = if let Some(view) = &buffer {
+            let resource = &view.shadow.buffer;
+            (resource, native_heap.clear_uav_pair(list, resource, Some(&view.desc)))
+        } else if let Some(texture) = host_texture {
+            (texture, native_heap.clear_texture_uav(list, texture, words.as_ref()))
+        } else {
+            return;
+        };
+        let Some((slot, gpu, cpu)) = pair else { return };
+        self.dynamic.push((heap_id, slot, 1));
+        self.bind_heaps(list);
+        if let Some(view) = &buffer {
+            view.shadow.refresh(list, view.address, view.len);
+            view.shadow.gpu_writes(list, view.address, view.len);
+            list.buffer_state(native_resource, crate::host::BUFFER_WRITE);
+            buffer_clear_barrier(list, native_resource);
+        } else {
+            crate::list::ensure_state(list, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+        }
+        // SAFETY: matching UAVs of a live resource in UAV state.
+        unsafe {
+            match value {
+                UavClear::Uint(values) => {
+                    list.list.ClearUnorderedAccessViewUint(gpu, cpu, native_resource, &values, rects);
+                }
+                UavClear::Float(values) => {
+                    list.list.ClearUnorderedAccessViewFloat(gpu, cpu, native_resource, &values, rects);
+                }
+            }
+        }
+        if buffer.is_some() {
+            buffer_clear_barrier(list, native_resource);
+        }
+    }
+
+    /// What draws and dispatches share: heaps, our root signature, the
+    /// pipeline, and per stage the user data, root views and the
+    /// descriptors its tables hold.
+    /// False if the draw or dispatch must not run: a table it reads could
+    /// not be made.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let l = &list.list;
+        self.bind_heaps(list);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -1028,7 +1109,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1040,19 +1120,13 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::execute(
+            list,
+            &signature,
+            max,
+            (&args.buffer, args.offset(arguments)),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+        );
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1100,6 +1174,21 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     Some(signature)
 }
 
+fn buffer_clear_barrier(list: &HostList, buffer: &ID3D12Resource) {
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed buffer that the barrier never releases.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
+            }),
+        },
+    };
+    // SAFETY: a live buffer held in the open list's state tracker.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
+}
+
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
 fn readable(list: &HostList, u: &UsedResource, view: &View) {
@@ -1116,6 +1205,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {

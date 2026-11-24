@@ -481,9 +481,64 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// Uses the host copy when the list already wrote the footprint's buffer.
+/// Other uploads keep a separate CPU snapshot for each copy.
+#[cfg(windows)]
+fn placed_copy_source(
+    list: &crate::host::HostList,
+    resource: This,
+    offset: u64,
+    bytes: u64,
+    read: &std::ops::Range<u64>,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+
+    let data = buffer_range(resource, offset, bytes)?;
+    let address = data as u64;
+    let read_address = address + read.start;
+    let read_bytes = read.end - read.start;
+    let source = list
+        .written_shadow(read_address as usize, read_bytes as usize)
+        .and_then(|shadow| {
+            let offset = shadow.offset_for_range(address, bytes)?;
+            Some((shadow, offset))
+        });
+    let Some((shadow, offset)) = source else {
+        let (upload, staging) = list.upload(crate::host::host()?, bytes)?;
+        // Wine can report the mapped upload address as MEM_FREE.
+        list.defer_fill(staging, data, bytes as usize);
+        return Some((upload, 0));
+    };
+    let staging = if offset.is_multiple_of(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.into()) {
+        None
+    } else {
+        // A guest footprint can start at an unaligned offset in the shadow.
+        // Rebase it on the GPU so earlier writes remain visible to this copy.
+        Some(crate::host::host()?.shared_buffer(bytes)?.0)
+    };
+    shadow.refresh(list, read_address, read_bytes);
+    list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+    let Some(staging) = staging else {
+        return Some((shadow.buffer.clone(), offset));
+    };
+    list.buffer_state(&staging, COPY_DEST);
+    // SAFETY: both buffers are held by the list; the source range is checked
+    // and the staging buffer has exactly enough space for the footprint.
+    unsafe {
+        list.list.CopyBufferRegion(
+            &staging,
+            read.start,
+            &shadow.buffer,
+            offset + read.start,
+            read_bytes,
+        );
+    }
+    list.buffer_state(&staging, crate::host::BUFFER_READ);
+    Some((staging, 0))
+}
+
+/// Texture to texture on the GPU. A placed buffer source uses the host copy
+/// after a GPU write in this list, or an upload buffer filled at submission.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -512,30 +567,34 @@ extern "system" fn copy_texture_region(
             return;
         };
         let mut from = src;
-        let _upload; // keeps the source alive while this call records it
+        let _buffer; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
+        // SAFETY: the title passes source box coordinates or null.
+        let source_box = unsafe { source_box.as_ref() };
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+            let read_span = source_box
+                .and_then(|bounds| src.footprint.box_bytes(*bounds))
+                .unwrap_or(0..bytes);
+            let Some((buffer, offset)) =
+                placed_copy_source(list, src.resource, src.footprint.offset, bytes, &read_span)
+            else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = offset;
             #[cfg(feature = "diagnostics")]
             {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                // SAFETY: a live buffer; the range is inside it.
+                read = Some((
+                    unsafe { buffer.GetGPUVirtualAddress() } + offset + read_span.start,
+                    read_span.end - read_span.start,
+                ));
             }
-            _upload = buffer;
+            _buffer = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
@@ -550,7 +609,7 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let host_box = source_box.map(|bounds| std::ptr::from_ref(bounds).cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -761,6 +820,63 @@ extern "system" fn clear_dsv(
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
+
+/// Clear a resource-backed UAV with a matching bound GPU UAV and CPU UAV.
+#[cfg(windows)]
+fn clear_uav(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    value: crate::draw::UavClear,
+    count: u32,
+    rects: *const Rect,
+) {
+    let rects = if count == 0 || rects.is_null() {
+        &[]
+    } else {
+        // SAFETY: the title passes count rectangles in the host's layout.
+        unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+    };
+    with_state(this, |list, state| state.clear_uav(list, gpu, cpu, resource, value, rects));
+}
+
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    // SAFETY: the title passes four values; null is tolerated.
+    if let Some(values) = unsafe { values.as_ref() } {
+        clear_uav(this, gpu, cpu, resource, crate::draw::UavClear::Uint(*values), count, rects);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, values, count, rects);
+}
+
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    // SAFETY: the title passes four values; null is tolerated.
+    if let Some(values) = unsafe { values.as_ref() } {
+        clear_uav(this, gpu, cpu, resource, crate::draw::UavClear::Float(*values), count, rects);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, values, count, rects);
+}
+
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
@@ -1385,7 +1501,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 55] = [
+const METHODS: [(usize, *const ()); 57] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -1426,6 +1542,8 @@ const METHODS: [(usize, *const ()); 55] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (56, set_marker as *const ()),                // 0x1c0
     (57, begin_event as *const ()),               // 0x1c8
     (58, end_event as *const ()),                 // 0x1d0
