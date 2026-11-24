@@ -6961,6 +6961,33 @@ mod tests {
     }
 
     #[test]
+    fn joined_descriptor_compares_must_gate_the_access() {
+        use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+
+        let (layout, used) = texture_and_uav_tables();
+        let lowered = lower_wave(WATERFALL_JOINED_WAVE32, layout, used, false).unwrap();
+        assert_eq!(lowered.nonuniform_handles, 1);
+        assert!(!lowered.wave_ops);
+
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let select = words.iter_mut().find(|w| **w == 0xBE95_3C15).unwrap();
+        // Save EXEC without narrowing it to lanes with matching descriptors.
+        *select = 0xBE95_037E; // s_mov_b32 s21, exec_lo
+        let (layout, used) = texture_and_uav_tables();
+        match lower_wave(&words, layout, used, false) {
+            Err(crate::ShaderError::Unsupported {
+                what: "a descriptor read from the first lane outside a waterfall loop",
+                ..
+            }) => {}
+            Err(err) => panic!("unexpected refusal: {err:?}"),
+            Ok(lowered) => panic!(
+                "accepted the unused compares and emitted {} nonuniform handle(s)",
+                lowered.nonuniform_handles
+            ),
+        }
+    }
+
+    #[test]
     fn buffer_formats_by_number() {
         // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
         // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.

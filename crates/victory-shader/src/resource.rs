@@ -14,7 +14,7 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Structured};
 
@@ -159,10 +159,6 @@ pub fn track(
             .collect(),
         ..Resources::default()
     };
-    // `v_readfirstlane_b32` results descriptors are read from.
-    let mut first_lane: Vec<Value> = Vec::new();
-    // Per descriptor read from the first lane: where, and those results.
-    let mut first_lane_at: Vec<(usize, Vec<Value>)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -174,9 +170,23 @@ pub fn track(
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 let words = t.first_lane_words(inst, op).unwrap_or_default();
                 if !words.is_empty() {
-                    first_lane_at.push((inst.machine.offset, words.clone()));
+                    let waterfall = t.waterfall(site, &words);
+                    if words.iter().any(|w| !waterfall.reads.contains(w)) {
+                        return Err(fail(
+                            "a descriptor read from the first lane outside a waterfall loop",
+                        ));
+                    }
+                    for cmp in waterfall.compares {
+                        if !out.waterfall.compares.contains(&cmp) {
+                            out.waterfall.compares.push(cmp);
+                        }
+                    }
+                    for read in waterfall.reads {
+                        if !out.waterfall.reads.contains(&read) {
+                            out.waterfall.reads.push(read);
+                        }
+                    }
                 }
-                first_lane.extend(words);
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
             };
@@ -213,18 +223,6 @@ pub fn track(
                 }
                 _ => {}
             }
-        }
-    }
-    out.waterfall = t.waterfall(&first_lane);
-    // Taking the first lane's descriptor as each lane's own holds only in
-    // a waterfall loop: one whose compare of the first lane's dwords with
-    // the lane's own repeats the access until every lane has had its turn.
-    for (offset, words) in first_lane_at {
-        if words.iter().any(|w| !out.waterfall.reads.contains(w)) {
-            return Err(ShaderError::Unsupported {
-                offset,
-                what: "a descriptor read from the first lane outside a waterfall loop",
-            });
         }
     }
     Ok(out)
@@ -1384,66 +1382,120 @@ impl<'a> Tracer<'a> {
         false
     }
 
-    /// The waterfall loops over descriptors read from the first lane (the
-    /// `v_readfirstlane_b32` results `reads`): the `v_cmp_eq` of those
-    /// results with the dwords they read.
-    fn waterfall(&self, reads: &[Value]) -> Waterfall {
-        let mut out = Waterfall::default();
-        if reads.is_empty() {
-            return out;
-        }
-        for (b, block) in self.p.blocks.iter().enumerate() {
-            for (i, inst) in block.insts.iter().enumerate() {
-                let Fields::Valu(f) = &inst.fields else {
-                    continue;
-                };
-                let Some(ty) = inst
-                    .name()
-                    .strip_prefix("v_cmp_eq_")
-                    .or(inst.name().strip_prefix("v_cmpx_eq_"))
-                else {
-                    continue;
-                };
-                let dwords = match ty {
-                    "u32" | "i32" => 1,
-                    "u64" | "i64" => 2,
-                    _ => continue,
-                };
-                if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
-                    continue;
+    /// Definitions that necessarily contribute a positive condition to
+    /// EXEC at the access. Stop at masks we cannot prove are conjunctions.
+    fn exec_conditions(&self, access: &Inst, word: u8) -> Vec<Site> {
+        let (and, save) = if self.p.wave64 {
+            ("s_and_b64", "s_and_saveexec_b64")
+        } else {
+            ("s_and_b32", "s_and_saveexec_b32")
+        };
+        let exec = Reg::S(EXEC + word);
+        let mut pending: Vec<Value> = access.read(exec).into_iter().collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut sites = Vec::new();
+        while let Some(v) = pending.pop() {
+            let Term::Value(v) = self.origin(v) else {
+                continue;
+            };
+            if !seen.insert(v) {
+                continue;
+            }
+            let Some(site) = self.defs[v.0 as usize] else {
+                continue;
+            };
+            let inst = self.inst(site);
+            let name = inst.name();
+            if name.starts_with("v_cmp") {
+                // A copy of the low mask into the high half does not
+                // establish the comparison for the upper 32 lanes.
+                if inst.writes.get(usize::from(word)).is_some_and(|w| w.1 == v) {
+                    sites.push(site);
                 }
-                // The first lane's dwords on one side, the lane's own on the
-                // other.
-                let pair = |first: &Operand, own: &Operand| -> Option<Vec<Value>> {
-                    let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) =
-                        (first, own)
-                    else {
-                        return None;
-                    };
-                    (0..dwords)
-                        .map(|k| {
-                            let Term::Value(x) = self.origin(inst.read(Reg::S(code + k))?) else {
-                                return None;
-                            };
-                            let lane = inst.read(Reg::V(reg + k))?;
-                            let (d, _) = self.defs[x.0 as usize]?;
-                            let same = reads.contains(&x)
-                                && self.same_loop(b, d)
-                                && self.lane_term(Term::Value(self.first_lane_source(x)?))
-                                    == self.lane_term(Term::Value(lane));
-                            same.then_some(x)
-                        })
-                        .collect()
+                continue;
+            }
+            let Fields::Sop { dst, src, .. } = &inst.fields else {
+                continue;
+            };
+            if name == save && inst.write(exec) == Some(v) {
+                pending.extend(inst.read(exec));
+            } else if name != and
+                || !matches!(dst, Some(Operand::Scalar { code, .. })
+                    if inst.write(Reg::S(code + word)) == Some(v))
+            {
+                continue;
+            }
+            pending.extend(src.iter().filter_map(|op| match *op {
+                Operand::Scalar { code, .. } => inst.read(Reg::S(code + word)),
+                _ => None,
+            }));
+        }
+        sites
+    }
+
+    /// A descriptor read is a waterfall candidate only when its equality
+    /// compares actually gate the access in the loop.
+    fn waterfall(&self, site: Site, reads: &[Value]) -> Waterfall {
+        let mut out = Waterfall::default();
+        let access = self.inst(site);
+        let mut conditions = self.exec_conditions(access, 0);
+        if self.p.wave64 {
+            let high = self.exec_conditions(access, 1);
+            conditions.retain(|cmp| high.contains(cmp));
+        }
+        for (b, i) in conditions {
+            let inst = self.inst((b, i));
+            if !self.same_loop(site.0, b) {
+                continue;
+            }
+            let Fields::Valu(f) = &inst.fields else {
+                continue;
+            };
+            let Some(ty) = inst
+                .name()
+                .strip_prefix("v_cmp_eq_")
+                .or(inst.name().strip_prefix("v_cmpx_eq_"))
+            else {
+                continue;
+            };
+            let dwords = match ty {
+                "u32" | "i32" => 1,
+                "u64" | "i64" => 2,
+                _ => continue,
+            };
+            if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                continue;
+            }
+            // The first lane's dwords on one side, the lane's own on the
+            // other.
+            let pair = |first: &Operand, own: &Operand| -> Option<Vec<Value>> {
+                let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) = (first, own)
+                else {
+                    return None;
                 };
-                let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
-                    continue;
-                };
-                if let Some(xs) = pair(a, c).or_else(|| pair(c, a)) {
-                    out.compares.push((b, i));
-                    for x in xs {
-                        if !out.reads.contains(&x) {
-                            out.reads.push(x);
-                        }
+                (0..dwords)
+                    .map(|k| {
+                        let Term::Value(x) = self.origin(inst.read(Reg::S(code + k))?) else {
+                            return None;
+                        };
+                        let lane = inst.read(Reg::V(reg + k))?;
+                        let (d, _) = self.defs[x.0 as usize]?;
+                        let same = reads.contains(&x)
+                            && self.same_loop(b, d)
+                            && self.lane_term(Term::Value(self.first_lane_source(x)?))
+                                == self.lane_term(Term::Value(lane));
+                        same.then_some(x)
+                    })
+                    .collect()
+            };
+            let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
+                continue;
+            };
+            if let Some(xs) = pair(a, c).or_else(|| pair(c, a)) {
+                out.compares.push((b, i));
+                for x in xs {
+                    if !out.reads.contains(&x) {
+                        out.reads.push(x);
                     }
                 }
             }
@@ -2447,6 +2499,23 @@ pub(crate) mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_wave64_access_needs_both_exec_halves_gated() {
+        waterfall(WATERFALL_FETCHED_WAVE64, true).unwrap();
+        let mut words = WATERFALL_FETCHED_WAVE64.to_vec();
+        let save = words.iter().position(|&w| w == 0xBE96_2416).unwrap();
+        assert_eq!(words[save + 1], 0xBF80_0000);
+        // Reenable the previous upper lanes while leaving EXEC_LO gated.
+        words[save + 1] = 0xBEFF_0317; // s_mov_b32 exec_hi, s23
+        assert!(matches!(
+            waterfall(&words, true),
+            Err(ShaderError::Unsupported {
+                what: "a descriptor read from the first lane outside a waterfall loop",
+                ..
+            })
+        ));
     }
 
     #[test]
