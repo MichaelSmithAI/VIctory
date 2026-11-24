@@ -1016,6 +1016,19 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn view_heap_guard_is_outside_the_dynamic_pool() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // SAFETY: the heap is live.
+        let slots = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+        assert_eq!(heap.guard_slot(), slots - 1);
+        assert_eq!(heap.dynamic(heap.dynamic), Some(heap.count()));
+        assert_eq!(heap.dynamic(1), None);
+        assert_eq!(heap.count() + heap.dynamic, heap.guard_slot());
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
