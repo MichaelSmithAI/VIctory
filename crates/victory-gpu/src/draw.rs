@@ -1537,9 +1537,9 @@ mod tests {
     }
 
     /// Synthetic GFX10 compute shader reading Root CBV (slot 0, dword 0) and
-    /// Root SRV (slot 1, byte offset `+1.5 MiB`), and storing `cbv ^ srv ^
-    /// 0xA5A5_5A5A` to Root UAV (slot 2, byte offset `+1.5 MiB`).
-    fn build_root_view_cs() -> (victory_shader::emit::HostShader, Vec<UsedResource>) {
+    /// Root SRV (slot 1), and storing `cbv ^ srv ^ 0xA5A5_5A5A` to Root UAV (slot 2).
+    /// Both views use the base offset, with an optional immediate for the SRV load.
+    fn build_root_view_cs(load_op: u32, base_offset: u32, load_offset: u32) -> (victory_shader::emit::HostShader, Vec<UsedResource>) {
         let s_mov_b32 =
             |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32;
         let s_load_dword = |dst: u8, base: u8, byte_off: u32| -> [u32; 2] {
@@ -1551,9 +1551,9 @@ mod tests {
         let vop1 = |op: u16, vdst: u8, src0: u16| -> u32 {
             0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
         };
-        let buffer_load_dword_offen = |vdst: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+        let buffer_load_offen = |vdst: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
             [
-                0x38 << 26 | 0x0C << 18 | (1 << 12),
+                0x38 << 26 | load_op << 18 | (1 << 12) | load_offset,
                 0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdst as u32) << 8 | vaddr as u32,
             ]
         };
@@ -1582,9 +1582,9 @@ mod tests {
         let vop2 = |op: u8, vdst: u8, src0: u16, vsrc1: u8| -> u32 {
             (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
         };
-        // v0 = 0x18_0000 (+1.5 MiB); v1 = srv[0x18_0000]; v2 = s6 ^ v1 ^ 0xA5A5_5A5A.
-        words.extend_from_slice(&[vop1(0x001, 0, 0xFF), 0x0018_0000]);
-        words.extend_from_slice(&buffer_load_dword_offen(1, 0, 8));
+        // v0 = base offset; v1 = srv[base offset + immediate]; v2 = s6 ^ v1 ^ 0xA5A5_5A5A.
+        words.extend_from_slice(&[vop1(0x001, 0, 0xFF), base_offset]);
+        words.extend_from_slice(&buffer_load_offen(1, 0, 8));
         words.push(vop2(0x1D, 2, 6, 1)); // v_xor_b32 v2, s6, v1
         words.extend_from_slice(&[vop2(0x1D, 2, 0xFF, 2), 0xA5A5_5A5A]); // v_xor_b32 v2, literal, v2
         words.extend_from_slice(&buffer_store_dword_offen(2, 0, 12));
@@ -1897,11 +1897,51 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_reads_a_split_halfword_from_an_interior_root_srv() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 adapter; interior root SRV control skipped");
+            return;
+        };
+        let (shader, used) = build_root_view_cs(0x0a, 0, 3);
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+        // Both allocations are physically backed throughout. The two cases
+        // expose 8 or 7 bytes after the same interior SRV start.
+        for (remaining, expected) in [(8, 0x7856), (7, 0)] {
+            let mut input = Box::new([0xDEAD_BEEFu32, 0xCAFE_1234, 0x5612_3456, 0xCAFE_AB78]);
+            let mut output = Box::new([0x5EE0_5EE0u32; 4]);
+            let src = input.as_mut_ptr() as u64;
+            let dst = output.as_mut_ptr() as u64;
+            crate::shadow::register(src as usize, src, 8 + remaining);
+            crate::shadow::register(dst as usize, dst, 16);
+
+            let list = host.new_list().expect("new_list");
+            let mut state = State::default();
+            state.set_pipeline(pso);
+            state.set_view(true, 1, src + 8);
+            state.set_view(true, 2, dst);
+            assert_eq!(state.root_view_bytes(true, 1, RootView::Srv), remaining as u32);
+            state.dispatch(&list, 1, 1, 1);
+            list.close();
+            host.execute(&[&list]);
+
+            // SAFETY: the title output stays live through the completed submission.
+            let value = unsafe { output.as_ptr().read_volatile() } ^ 0xA5A5_5A5A;
+            assert_eq!(value, expected, "remaining bytes {remaining}");
+            assert_eq!(output[1..], [0x5EE0_5EE0; 3]);
+            crate::shadow::unregister(src as usize, src);
+            crate::shadow::unregister(dst as usize, dst);
+            eprintln!("interior root SRV range {remaining}: {value:#06x}");
+        }
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        assert_eq!(release(pso), 0);
+    }
+
+    #[test]
     fn dispatch_binds_fallbacks_and_copies_root_uav_writes_back() {
         let Some(host) = crate::host::host() else {
             return;
         };
-        let (shader, used) = build_root_view_cs();
+        let (shader, used) = build_root_view_cs(0x0c, 0x18_0000, 0);
         let pso = crate::pipeline::test_compute_pipeline(shader, used);
 
         let unmapped = Allocation::reserved_unmapped(8 << 20);
