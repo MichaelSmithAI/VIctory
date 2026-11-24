@@ -103,6 +103,9 @@ pub(crate) mod pred {
     pub const OGE: u8 = 3;
     pub const OLT: u8 = 4;
     pub const OLE: u8 = 5;
+    // Not emitted: the AMD D3D12 driver treats it as UNE, so `v_cmp_lg`
+    // lowers as OLT | OGT instead.
+    #[allow(dead_code)]
     pub const ONE: u8 = 6;
     pub const ORD: u8 = 7;
     pub const UNO: u8 = 8;
@@ -289,6 +292,17 @@ impl Module {
             })
             .collect();
         self.constant(ty, Const::Aggregate(ids))
+    }
+
+    /// The value of an integer constant; `None` for anything else.
+    pub fn int_value(&self, v: V) -> Option<i64> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => Some(x),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Gives constant `old` the content of `new` (both stay valid).
@@ -485,8 +499,8 @@ impl Module {
         while let Some(top) = stack.last_mut() {
             let (b, k) = *top;
             top.1 += 1;
-            let (succs, len) = succs_of(self.blocks[b].term);
-            if k < len {
+            let succs = successors(self.blocks[b].term);
+            if k < succs.len() {
                 let s = succs[k];
                 if !seen[s] {
                     seen[s] = true;
@@ -656,8 +670,7 @@ impl Module {
         // DXC's loops; the AMD driver hangs on divergent loops otherwise.
         let mut preds = vec![Vec::new(); self.blocks.len()];
         for &b in post {
-            let (succs, len) = succs_of(self.blocks[b].term);
-            for &s in &succs[..len] {
+            for &s in successors(self.blocks[b].term).iter() {
                 preds[s].push(b);
             }
         }
@@ -671,14 +684,12 @@ impl Module {
                 && fold[*p].is_none()
                 && fold[h].is_none()
             {
-                let (ps, plen) = succs_of(self.blocks[*p].term);
-                // Both successors can be empty latches. Keep one if folding
-                // it would give the header two incoming values from the
-                // same predecessor.
-                let already_reaches_header = ps[..plen]
+                // Two empty latches can share a predecessor. Keep the second
+                // latch if folding it would merge distinct phi inputs.
+                let reaches_header = successors(self.blocks[*p].term)
                     .iter()
                     .any(|&s| s == h || fold[s].is_some_and(|(_, target)| target == h));
-                if !already_reaches_header {
+                if !reaches_header {
                     fold[b] = Some((*p, h));
                 }
             }
@@ -957,7 +968,8 @@ impl Module {
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
-        let mut rec = Vec::with_capacity(16);
+        // The operands of variable-length records, reused across them.
+        let mut r: Vec<u64> = Vec::with_capacity(16);
         for b in layout.iter().map(|&b| &self.blocks[b]) {
             for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
                 let inst = &self.insts[i as usize];
@@ -973,32 +985,32 @@ impl Module {
                     Op::Select(c, t, f) => w.record(29, &[rel(*t), rel(*f), rel(*c)]),
                     Op::Extract(a, idx) => w.record(26, &[rel(*a), u64::from(*idx)]),
                     Op::Call(f, args) => {
-                        rec.clear();
-                        rec.extend([
+                        r.clear();
+                        r.extend([
                             0,
                             1 << 15,
                             u64::from(self.funcs[*f as usize].ty.0),
                             rel(V::Func(*f)),
                         ]);
-                        rec.extend(args.iter().map(|&a| rel(a)));
-                        w.record(34, &rec);
+                        r.extend(args.iter().map(|&a| rel(a)));
+                        w.record(34, &r);
                     }
                     Op::Phi(incoming) => {
-                        rec.clear();
-                        rec.push(u64::from(inst.ty.0));
+                        r.clear();
+                        r.push(u64::from(inst.ty.0));
                         for &(v, pred) in incoming {
                             if seen[pred] {
-                                rec.push(signed(i64::from(inst_id) - i64::from(abs(v))));
-                                rec.push(from(pred));
+                                r.push(signed(i64::from(inst_id) - i64::from(abs(v))));
+                                r.push(from(pred));
                             }
                         }
-                        w.record(16, &rec);
+                        w.record(16, &r);
                     }
                     Op::Gep(ty, p, idx) => {
-                        rec.clear();
-                        rec.extend([0, u64::from(ty.0), rel(*p)]);
-                        rec.extend(idx.iter().map(|&i| rel(i)));
-                        w.record(43, &rec);
+                        r.clear();
+                        r.extend([0, u64::from(ty.0), rel(*p)]);
+                        r.extend(idx.iter().map(|&i| rel(i)));
+                        w.record(43, &r);
                     }
                     // Alignment 4 (log2 + 1), not volatile.
                     Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
@@ -1031,14 +1043,16 @@ impl Module {
     }
 }
 
-fn succs_of(term: Option<Term>) -> ([usize; 2], usize) {
-    match term {
-        Some(Term::Br(t)) => ([t, 0], 1),
-        Some(Term::CondBr(_, t, f)) => ([t, f], 2),
-        _ => ([0, 0], 0),
-    }
-}
+const MODULE_BLOCK: u64 = 8;
+const PARAMATTR_BLOCK: u64 = 9;
+const PARAMATTR_GROUP_BLOCK: u64 = 10;
+const CONSTANTS_BLOCK: u64 = 11;
+const FUNCTION_BLOCK: u64 = 12;
+const VALUE_SYMTAB_BLOCK: u64 = 14;
+const METADATA_BLOCK: u64 = 15;
+const TYPE_BLOCK: u64 = 17;
 
+/// Calls `f` with every value `op` reads, in operand order.
 fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
@@ -1052,7 +1066,7 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*c);
         }
         Op::Call(_, args) => args.iter().copied().for_each(f),
-        Op::Phi(inc) => inc.iter().for_each(|&(v, _)| f(v)),
+        Op::Phi(inc) => inc.iter().for_each(|x| f(x.0)),
         Op::Gep(_, p, idx) => {
             f(*p);
             idx.iter().copied().for_each(f);
@@ -1060,14 +1074,26 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
     }
 }
 
-const MODULE_BLOCK: u64 = 8;
-const PARAMATTR_BLOCK: u64 = 9;
-const PARAMATTR_GROUP_BLOCK: u64 = 10;
-const CONSTANTS_BLOCK: u64 = 11;
-const FUNCTION_BLOCK: u64 = 12;
-const VALUE_SYMTAB_BLOCK: u64 = 14;
-const METADATA_BLOCK: u64 = 15;
-const TYPE_BLOCK: u64 = 17;
+/// A block's successors (at most two), without allocating.
+struct Succs {
+    to: [usize; 2],
+    len: usize,
+}
+
+impl std::ops::Deref for Succs {
+    type Target = [usize];
+    fn deref(&self) -> &[usize] {
+        &self.to[..self.len]
+    }
+}
+
+fn successors(term: Option<Term>) -> Succs {
+    match term {
+        Some(Term::Br(t)) => Succs { to: [t, 0], len: 1 },
+        Some(Term::CondBr(_, t, f)) => Succs { to: [t, f], len: 2 },
+        _ => Succs { to: [0, 0], len: 0 },
+    }
+}
 
 fn chars(s: &str) -> Vec<u64> {
     s.bytes().map(u64::from).collect()
@@ -1220,6 +1246,195 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// A structured shader's shape: `stages` if/else diamonds in a row, each
+    /// merge with one phi per register (as the lowering makes them), then a
+    /// loop, and a tail that reads only the first `read` registers into a
+    /// side-effecting root.
+    fn synthetic(regs: usize, stages: usize, read: usize) -> Module {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let f = m.function("dx.op.synthetic", fty, Some(Attr::ReadNone), false);
+        let sink_ty = m.func_ty(void, vec![i32t, i32t]);
+        let sink = m.function("dx.op.sink", sink_ty, Some(Attr::NoUnwind), false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let mut b = m.new_block();
+        let mut cur: Vec<V> = (0..regs).map(|r| m.i32(r as u32)).collect();
+        for s in 0..stages {
+            let c = m.cmp(b, pred::EQ, cur[0], cur[s % regs]);
+            let (t, e, j) = (m.new_block(), m.new_block(), m.new_block());
+            m.terminate(b, Term::CondBr(c, t, e));
+            let x = m.call(t, f, vec![cur[s % regs], cur[(s + 1) % regs]]);
+            m.terminate(t, Term::Br(j));
+            m.terminate(e, Term::Br(j));
+            cur = (0..regs)
+                .map(|r| {
+                    let p = m.phi(j, i32t);
+                    let tv = if r == s % regs { x } else { cur[r] };
+                    m.set_phi(p, vec![(tv, t), (cur[r], e)]);
+                    p
+                })
+                .collect();
+            b = j;
+        }
+        // A loop: header phis fed back from an empty latch (which is folded).
+        let (head, body, latch, exit) =
+            (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        m.terminate(b, Term::Br(head));
+        let phis: Vec<V> = (0..regs).map(|_| m.phi(head, i32t)).collect();
+        let one = m.i32(1);
+        let stepped: Vec<V> = phis
+            .iter()
+            .map(|&p| m.bin(body, Bin::Add, p, one))
+            .collect();
+        let c = m.cmp(body, pred::IULT, stepped[0], cur[0]);
+        m.terminate(head, Term::Br(body));
+        m.terminate(body, Term::CondBr(c, latch, exit));
+        m.terminate(latch, Term::Br(head));
+        for r in 0..regs {
+            m.set_phi(phis[r], vec![(cur[r], b), (stepped[r], latch)]);
+        }
+        let mut acc = stepped[0];
+        for &v in &stepped[1..read.max(1)] {
+            acc = m.bin(exit, Bin::Add, acc, v);
+        }
+        let _ = m.call(exit, sink, vec![acc, cur[0]]);
+        m.terminate(exit, Term::Ret);
+        m
+    }
+
+    /// FNV-1a, to pin a written module's exact bytes.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Backward liveness by whole passes over the instructions until one
+    /// changes nothing, used as a reference for the worklist in `live_in`.
+    fn live_by_passes(m: &Module) -> Vec<bool> {
+        let (rpo, seen) = m.reachable_rpo();
+        let mut live = vec![false; m.insts.len()];
+        for &b in &rpo {
+            let blk = &m.blocks[b];
+            for &i in &blk.body {
+                if m.is_root(&m.insts[i as usize]) {
+                    live[i as usize] = true;
+                }
+            }
+            if let Some(Term::CondBr(V::Inst(c), ..)) = blk.term {
+                live[c as usize] = true;
+            }
+        }
+        for md in &m.mds {
+            if let MdDef::Value(_, V::Inst(i)) = md {
+                live[*i as usize] = true;
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (i, inst) in m.insts.iter().enumerate() {
+                if live[i] {
+                    match &inst.op {
+                        Op::Phi(inc) => {
+                            for &(v, pred) in inc {
+                                if seen[pred]
+                                    && let V::Inst(j) = v
+                                    && !live[j as usize]
+                                {
+                                    live[j as usize] = true;
+                                    changed = true;
+                                }
+                            }
+                        }
+                        op => for_each_operand(op, |v| {
+                            if let V::Inst(j) = v
+                                && !live[j as usize]
+                            {
+                                live[j as usize] = true;
+                                changed = true;
+                            }
+                        }),
+                    }
+                }
+            }
+        }
+        live
+    }
+
+    #[test]
+    fn worklist_liveness_matches_passes() {
+        for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
+            let m = synthetic(regs, stages, read);
+            let live = m.live();
+            assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
+        }
+    }
+
+    #[test]
+    fn unread_phis_are_dropped() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i32t = m.int(32);
+        let sink_ty = m.func_ty(void, vec![i32t]);
+        let sink = m.function("dx.op.sink", sink_ty, Some(Attr::NoUnwind), false);
+        let (entry, join) = (m.new_block(), m.new_block());
+        let (a, b) = (m.i32(1), m.i32(2));
+        m.terminate(entry, Term::Br(join));
+        let read = m.phi(join, i32t);
+        let unread = m.phi(join, i32t);
+        // A cycle of phis that only feed each other stays dead.
+        let cyc_a = m.phi(join, i32t);
+        let cyc_b = m.phi(join, i32t);
+        m.set_phi(read, vec![(a, entry)]);
+        m.set_phi(unread, vec![(b, entry)]);
+        m.set_phi(cyc_a, vec![(cyc_b, entry)]);
+        m.set_phi(cyc_b, vec![(cyc_a, entry)]);
+        let sum = m.bin(join, Bin::Add, read, b);
+        let _ = m.call(join, sink, vec![sum]);
+        m.terminate(join, Term::Ret);
+        let ids = |v: V| match v {
+            V::Inst(i) => i as usize,
+            _ => unreachable!(),
+        };
+        let live = m.live();
+        assert!(live[ids(read)] && live[ids(sum)]);
+        assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
+        assert_eq!(live, live_by_passes(&m));
+    }
+
+    #[test]
+    fn successors_of_each_terminator() {
+        assert!(successors(None).is_empty());
+        assert!(successors(Some(Term::Ret)).is_empty());
+        assert_eq!(&*successors(Some(Term::Br(7))), &[7]);
+        assert_eq!(&*successors(Some(Term::CondBr(V::Const(0), 3, 5))), &[3, 5]);
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p victory-shader bitcode -- --ignored --nocapture"]
+    fn bench_write() {
+        for (regs, stages, read) in [(64, 64, 64), (128, 256, 32), (256, 512, 256)] {
+            let m = synthetic(regs, stages, read);
+            let bytes = m.write();
+            let runs = 5;
+            let t = std::time::Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(m.write());
+            }
+            let per = t.elapsed() / runs;
+            println!(
+                "write {regs} regs x {stages} stages ({} insts): {per:?}, {} bytes, fnv {:#018x}",
+                m.insts.len(),
+                bytes.len(),
+                fnv(&bytes)
+            );
+        }
     }
 
     #[test]
@@ -1425,8 +1640,8 @@ mod tests {
         let _dead_root_srv = s.root_srv_handle(0);
 
         let idx0 = s.m.i32(0);
-        let uav_h = s.heap_handle(b, idx0, false, (10 | 0x1000, 0x409));
-        let _samp_h = s.heap_handle(b, idx0, true, (14, 0));
+        let uav_h = s.heap_handle(b, idx0, false, false, (10 | 0x1000, 0x409));
+        let _samp_h = s.heap_handle(b, idx0, true, false, (14, 0));
         let iu = s.m.undef(s.t.i32);
         let _dead_uav_ld = s.op(
             b,
