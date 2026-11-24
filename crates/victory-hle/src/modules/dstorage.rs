@@ -630,11 +630,28 @@ impl Lane {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
     }
 
+    fn cancel(&mut self, mask: u64, value: u64) -> bool {
+        let matches = |req: &Request| (req.tag & mask) == value;
+        let before = self.unsubmitted.len() + self.reads.len();
+        self.unsubmitted
+            .retain(|cmd| !matches!(cmd, Command::Read(req) if matches(req)));
+        self.reads.retain(|(_, req)| !matches(req));
+        let removed = self.unsubmitted.len() + self.reads.len() != before;
+        if removed {
+            self.flush();
+        }
+        removed
+    }
+
     /// Writes the status entries whose earlier reads have all finished.
     fn flush(&mut self) {
         while let Some(&(seq, _)) = self.statuses.front() {
             let waiting = self.reads.front().map(|r| r.0);
-            if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
+            if waiting
+                .into_iter()
+                .chain(self.running.first().copied())
+                .any(|s| s < seq)
+            {
                 return;
             }
             let Some((_, status)) = self.statuses.pop_front() else {
@@ -827,13 +844,7 @@ extern "system" fn cancel_requests_with_tag(this: QueueRef, mask: u64, value: u6
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
     };
-    let matches = |req: &Request| (req.tag & mask) == value;
-    let before = lane.unsubmitted.len() + lane.reads.len();
-    lane.unsubmitted
-        .retain(|cmd| !matches!(cmd, Command::Read(req) if matches(req)));
-    lane.reads.retain(|(_, req)| !matches(req));
-    if lane.unsubmitted.len() + lane.reads.len() != before {
-        lane.flush();
+    if lane.cancel(mask, value) {
         scheduler.finished.notify_all();
     }
 }
@@ -1719,6 +1730,46 @@ mod tests {
         assert_eq!(info.desc.capacity, 0x80);
         assert_eq!(info.empty_slot_count, 0);
         assert_eq!(info.request_count_until_auto_submit, 0);
+    }
+
+    #[test]
+    fn cancellation_keeps_running_reads_and_their_status_order() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 128));
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        let src = [11u8, 22, 33];
+        let mut dst = [0u8; 3];
+        let lane = l.lanes.get_mut(&0).unwrap();
+        for i in 0..3 {
+            let mut req = request(
+                MEMORY_SOURCE,
+                dst[i..].as_mut_ptr().cast(),
+                1,
+                src[i..].as_ptr().cast(),
+                0,
+                1,
+            );
+            req.tag = if i < 2 { 0x10 } else { 0x20 };
+            lane.unsubmitted.push(Command::Read(req));
+        }
+        add_ref_instance(array);
+        lane.unsubmitted
+            .push(Command::Status(Status { array, index: 0 }));
+        // SAFETY: the status array here was created for this fixture.
+        unsafe { &(*array).state.entries[0] }.store(E_PENDING, Ordering::Release);
+        l.submit(0);
+        let running = l.start().unwrap();
+        let lane = l.lanes.get_mut(&0).unwrap();
+        assert!(lane.cancel(0xff, 0x10));
+        assert_eq!(lane.entries(), 3);
+        let unmatched = l.start().unwrap();
+        assert_eq!(unmatched.request.tag, 0x20);
+        l.finish(&unmatched, execute(&unmatched.request));
+        assert_eq!(result(array.cast(), 0), E_PENDING);
+        l.finish(&running, execute(&running.request));
+        assert_eq!(result(array.cast(), 0), S_OK);
+        assert_eq!(dst, [11, 0, 33]);
+        release(array);
     }
 
     #[test]
