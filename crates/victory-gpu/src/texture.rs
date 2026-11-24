@@ -135,25 +135,42 @@ fn texture_span(resource: This) -> Option<(*const u8, usize)> {
     usize::try_from(layout.size).ok().map(|size| (memory, size))
 }
 
-/// Hashes `[memory, memory + size)` when committed, reading through the kernel
-/// so concurrently unmapped pages do not fault.
+/// Snapshots readable title bytes using kernel reads so concurrent unmaps do
+/// not fault. Partial snapshots include the offsets of the readable bytes.
 fn hash_unwatched(memory: *const u8, size: usize) -> Option<blake3::Hash> {
-    if !committed(memory, size) {
-        return None;
-    }
+    let full = committed(memory, size);
     let mut hasher = blake3::Hasher::new();
+    hasher.update(&[u8::from(full)]);
     let mut chunk = vec![0u8; size.min(64 << 10)];
-    let mut offset = 0;
-    while offset < size {
+    let mut readable = false;
+    for offset in (0..size).step_by(64 << 10) {
         let n = (size - offset).min(chunk.len());
-        // SAFETY: `offset < size`; `copy_mapped` reads via the kernel, zeroing
-        // any page unmapped concurrently.
-        let src = unsafe { memory.add(offset) };
-        crate::host::copy_mapped(chunk.as_mut_ptr(), src, n, false);
-        hasher.update(&chunk[..n]);
-        offset += n;
+        let dst = &mut chunk[..n];
+        let src = memory.wrapping_add(offset);
+        if full {
+            crate::host::copy_mapped(dst.as_mut_ptr(), src, n, false);
+            hasher.update(dst);
+            readable = true;
+        } else {
+            let residency = read_resident(src, dst);
+            let mut hash_range = |start: usize, end: usize| {
+                hasher.update(&(offset + start).to_le_bytes());
+                hasher.update(&(end - start).to_le_bytes());
+                hasher.update(&dst[start..end]);
+                readable = true;
+            };
+            match residency {
+                Residency::Unmapped => {}
+                Residency::Full => hash_range(0, n),
+                Residency::Partial(intervals) => {
+                    for (start, end) in intervals {
+                        hash_range(start, end);
+                    }
+                }
+            }
+        }
     }
-    Some(hasher.finalize())
+    readable.then(|| hasher.finalize())
 }
 
 /// Records that a host copy or resolve on `list` writes `resource`.
@@ -777,6 +794,22 @@ mod tests {
             type Release = extern "system" fn(This) -> u32;
             crate::object::slot::<Release>(self.0, 0x10)(self.0);
         }
+    }
+
+    #[test]
+    fn host_written_snapshot_detects_changes_to_partially_resident_bytes() {
+        const TILE: usize = 64 * 1024;
+        let region = VirtualRegion::reserve(2 * TILE);
+        assert_eq!(hash_unwatched(region.ptr, 2 * TILE), None);
+        region.commit(0, TILE);
+        let before = hash_unwatched(region.ptr, 2 * TILE).expect("resident tile");
+        assert_eq!(hash_unwatched(region.ptr, 2 * TILE), Some(before));
+        // SAFETY: the first tile is committed.
+        unsafe { region.write_slice(0, &[0x35]) };
+        let changed = hash_unwatched(region.ptr, 2 * TILE).expect("resident tile");
+        assert_ne!(changed, before);
+        region.commit(TILE, TILE);
+        assert_ne!(hash_unwatched(region.ptr, 2 * TILE), Some(changed));
     }
 
     #[test]
