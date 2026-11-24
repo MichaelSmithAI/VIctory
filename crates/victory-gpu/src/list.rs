@@ -490,6 +490,7 @@ fn placed_copy_source(
     offset: u64,
     bytes: u64,
     read: &std::ops::Range<u64>,
+    rows: Option<impl Iterator<Item = std::ops::Range<u64>>>,
 ) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
     use windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
 
@@ -497,8 +498,12 @@ fn placed_copy_source(
     let address = data as u64;
     let read_address = address + read.start;
     let read_bytes = read.end - read.start;
+    let absolute = |range: std::ops::Range<u64>| {
+        (address + range.start) as usize..(address + range.end) as usize
+    };
     let source = list
-        .written_shadow(read_address as usize, read_bytes as usize)
+        .written_shadow(std::iter::once(absolute(read.clone())))
+        .or_else(|| list.written_shadow(rows?.map(absolute)))
         .and_then(|shadow| {
             let offset = shadow.offset_for_range(address, bytes)?;
             Some((shadow, offset))
@@ -576,11 +581,10 @@ extern "system" fn copy_texture_region(
             let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
-            let read_span = source_box
-                .and_then(|bounds| src.footprint.box_bytes(*bounds))
-                .unwrap_or(0..bytes);
+            let (read_span, rows) = src.footprint.box_reads(source_box.copied()).unzip();
+            let read_span = read_span.unwrap_or(0..bytes);
             let Some((buffer, offset)) =
-                placed_copy_source(list, src.resource, src.footprint.offset, bytes, &read_span)
+                placed_copy_source(list, src.resource, src.footprint.offset, bytes, &read_span, rows)
             else {
                 return;
             };

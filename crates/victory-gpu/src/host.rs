@@ -1506,36 +1506,40 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
-    /// The latest producer of this range if it wrote a covering host
-    /// copy on the GPU. Deferred CPU writes keep their upload snapshots.
+    /// The shared host copy on which all requested ranges were written.
+    /// Deferred CPU writes keep their upload snapshots.
     pub(crate) fn written_shadow(
         &self,
-        address: usize,
-        len: usize,
+        mut ranges: impl Iterator<Item = std::ops::Range<usize>>,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        let end = address.checked_add(len)?;
-        let overlaps = |at: usize, size: usize| size != 0 && at < end && address < at + size;
-        let mut newest = None;
-        for step in self.deferred().copies.iter().rev() {
-            match step {
-                Step::GpuWrite(shadow, at, size) if overlaps(*at, *size) => {
-                    // A newer partial write can overlay a full producer in
-                    // the same copy. Separate shadows cannot share the bytes.
-                    if newest.is_some_and(|other| !std::sync::Arc::ptr_eq(other, shadow)) {
-                        return None;
+        let deferred = self.deferred();
+        let producer = |range: std::ops::Range<usize>| {
+            let overlaps = |at: usize, size: usize| {
+                size != 0 && at < range.end && range.start < at.saturating_add(size)
+            };
+            let mut newest = None;
+            for step in deferred.copies.iter().rev() {
+                match step {
+                    Step::GpuWrite(shadow, at, size) if overlaps(*at, *size) => {
+                        if newest.is_some_and(|other| !std::sync::Arc::ptr_eq(other, shadow)) {
+                            return None;
+                        }
+                        if *at <= range.start && range.end <= at.saturating_add(*size) {
+                            return Some(shadow);
+                        }
+                        newest = Some(shadow);
                     }
-                    if *at <= address && end <= at + size {
-                        return Some(shadow.clone());
-                    }
-                    newest = Some(shadow);
+                    Step::Copy(dst, _, size) if overlaps(*dst, *size) => return None,
+                    Step::Run(_) => return None,
+                    _ => {}
                 }
-                Step::Copy(dst, _, size) if overlaps(*dst, *size) => return None,
-                // Raw deferred CPU work can write this range too.
-                Step::Run(_) => return None,
-                _ => {}
             }
-        }
-        None
+            None
+        };
+        let shadow = producer(ranges.next()?)?;
+        ranges
+            .all(|range| producer(range).is_some_and(|other| std::sync::Arc::ptr_eq(other, shadow)))
+            .then(|| shadow.clone())
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
