@@ -211,6 +211,32 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
     }
 }
 
+/// Binds a statically bounded read through a guest root-constant pair.
+fn constant_srv(list: &HostList, root: Option<&Root>, bytes: u32) -> Option<u64> {
+    let Root::Constants(words) = root? else {
+        return None;
+    };
+    let &[lo, hi] = words.get(..2)? else {
+        return None;
+    };
+    let address = u64::from(lo) | (u64::from(hi) << 32);
+    if !address.is_multiple_of(4)
+        || !bytes.is_multiple_of(4)
+        || bytes == 0
+        || u64::from(bytes) > ROOT_SRV_MAX
+    {
+        return None;
+    }
+    let bytes = u64::from(bytes);
+    let shadow = crate::shadow::find_registered(address, bytes)?;
+    let gpu = shadow.gpu(address);
+    if !gpu.is_multiple_of(4) {
+        return None;
+    }
+    shadow.refresh(list, address, bytes);
+    Some(gpu)
+}
+
 fn emit_uav_barrier(list: &HostList) {
     let barrier = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -452,7 +478,9 @@ impl State {
             );
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -511,7 +539,7 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -588,8 +616,24 @@ impl State {
                         }
                         bound_params |= 1u64 << param;
                     }
+                    let root = self.roots_ref(compute).get(usize::from(slot));
+                    if kind == RootView::Srv
+                        && let Some(&(_, bytes)) =
+                            t.host.root_constant_srvs.iter().find(|&&(s, _)| s == slot)
+                    {
+                        let Some(gpu) = constant_srv(list, root, bytes) else {
+                            once!(
+                                slot,
+                                "a constant-backed root SRV is outside a mapped buffer"
+                            );
+                            return false;
+                        };
+                        // SAFETY: an open compute list; the bounded host range is kept by refresh.
+                        unsafe { l.SetComputeRootShaderResourceView(param, gpu) };
+                        continue;
+                    }
                     let uav = kind == RootView::Uav;
-                    let gpu = match self.roots_ref(compute).get(usize::from(slot)) {
+                    let gpu = match root {
                         Some(&Root::View(address)) if address != 0 => {
                             match root_view(list, address, kind) {
                                 Some(gpu) => gpu,
@@ -652,6 +696,7 @@ impl State {
                 }
             }
         }
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -676,7 +721,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -1243,10 +1291,7 @@ impl State {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,
@@ -1639,6 +1684,146 @@ mod tests {
         };
         let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
         (shader, used)
+    }
+
+    #[test]
+    fn dispatch_reads_buffer_through_a_spilled_constant_pair() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("Skipping constant-pair readback because D3D12 is unavailable");
+            return;
+        };
+        let words = [
+            0xF408_0100u32, // s_load_dwordx4 s[4:7], s[0:1], 0
+            0xFA00_0000,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF400_0202, // s_load_dword s8, s[4:5], 4
+            0xFA00_0004,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0208, // v_mov_b32 v1, s8
+            0x3A02_0204, // v_xor_b32 v1, s4, v1 (numeric use of low word)
+            0xDC70_8000, // global_store_dword v0, v1, s[6:7]
+            0x0006_0100,
+            0xBF81_0000, // s_endpgm
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 18,
+            slot: 1,
+        }];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 16,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 18,
+                    slot: 1,
+                },
+            ],
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 4 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = victory_shader::ir::build_with(&native.code, false, 8, true).unwrap();
+        let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(shader.root_constant_srvs, [(0, 8)]);
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+
+        let src = Allocation::watched(64 << 10);
+        let dst = Allocation::watched(64 << 10);
+        crate::shadow::register(src.ptr as usize, src.addr(), 8);
+        crate::shadow::register(dst.ptr as usize, dst.addr(), 4);
+        let value = 0xDEAD_BEEFu32;
+        // SAFETY: dword 1 is within the registered source allocation.
+        unsafe { src.ptr.cast::<u32>().add(1).write(value) };
+
+        let list = host.new_list().expect("new_list");
+        let mut state = State::default();
+        state.set_pipeline(pso);
+        state.set_constants(true, 0, &[src.addr() as u32, (src.addr() >> 32) as u32], 0);
+        state.set_view(true, 1, dst.addr());
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: dword 0 is within the registered destination allocation.
+        assert_eq!(
+            unsafe { dst.ptr.cast::<u32>().read() },
+            value ^ src.addr() as u32
+        );
+
+        // The final dword alone cannot cover the statically required eight
+        // bytes. The second dispatch must leave the output untouched.
+        let short = src.addr() + 4;
+        let sentinel = 0x1357_2468;
+        // SAFETY: dword 0 is within the registered destination allocation.
+        unsafe { dst.ptr.cast::<u32>().write(sentinel) };
+        list.reset();
+        state.reset(pso);
+        state.set_constants(true, 0, &[short as u32, (short >> 32) as u32], 0);
+        state.set_view(true, 1, dst.addr());
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: dword 0 is within the registered destination allocation.
+        assert_eq!(unsafe { dst.ptr.cast::<u32>().read() }, sentinel);
+        crate::shadow::unregister(src.ptr as usize, src.addr());
+        crate::shadow::unregister(dst.ptr as usize, dst.addr());
+        eprintln!("Constant-pair readback and short-range control passed");
+    }
+
+    #[test]
+    fn constants_srv_requires_two_words_and_a_registered_buffer_extent() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().expect("new_list");
+        let memory = Allocation::watched(64 << 10);
+        let base = memory.addr();
+        let root = |address: u64| Root::Constants(vec![address as u32, (address >> 32) as u32]);
+        assert!(constant_srv(&list, Some(&root(base)), 8).is_none());
+
+        let registered = memory.ptr as usize;
+        crate::shadow::register(registered, base, 16);
+        let gpu = crate::shadow::find_registered(base, 16).unwrap().gpu(base);
+        assert_eq!(
+            constant_srv(&list, Some(&root(base + 4)), 12),
+            Some(gpu + 4)
+        );
+        assert!(constant_srv(&list, Some(&root(base + 4)), 16).is_none());
+        assert!(constant_srv(&list, Some(&root(base + 1)), 4).is_none());
+        assert!(constant_srv(&list, Some(&Root::Constants(vec![base as u32])), 4).is_none());
+        assert!(constant_srv(&list, Some(&Root::View(base)), 4).is_none());
+        crate::shadow::unregister(registered, base);
     }
 
     #[test]

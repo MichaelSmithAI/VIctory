@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_constant_srvs: Vec<(u8, u32)>,
     pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
@@ -159,6 +160,8 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    constant_srv_reads: HashMap<Site, (u8, u32)>,
+    root_constant_srvs: Vec<(u8, u32)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
@@ -466,6 +469,8 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            constant_srv_reads: x.res.constant_srv_reads.iter().copied().collect(),
+            root_constant_srvs: Vec::new(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -954,6 +959,7 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_constant_srvs: self.root_constant_srvs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2795,14 +2801,18 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        let root = self
+            .scalar
+            .get(&site)
+            .and_then(|a| self.x.native.layout.get(a.param));
+        let constant_srv = self.constant_srv_reads.get(&site).copied();
         let root_desc = self.scalar.get(&site).copied().and_then(|a| {
-            (self.x.native.layout.get(a.param)?.root == RootType::Descriptor).then_some(
-                Source::Built {
+            root.filter(|r| r.root == RootType::Descriptor || constant_srv.is_some())
+                .map(|_| Source::Built {
                     address: a,
                     bits: 0,
                     words: [0, 0],
-                },
-            )
+                })
         });
         let Some(rest) = name.strip_prefix("s_buffer_load_dword").or_else(|| {
             root_desc
@@ -2861,16 +2871,24 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(
-            kind,
-            Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
-        ) {
+        if constant_srv.is_some()
+            || matches!(kind, Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
+        {
             let u = if kind.is_some_and(|u| u.kind == ResourceType::Uav) {
                 0x1000
             } else {
                 0
             };
-            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let h = if let Some((slot, end)) = constant_srv {
+                if let Some((_, prior)) = self.root_constant_srvs.iter_mut().find(|r| r.0 == slot) {
+                    *prior = (*prior).max(end);
+                } else {
+                    self.root_constant_srvs.push((slot, end));
+                }
+                self.s.root_srv_handle(slot)
+            } else {
+                self.handle(site, src, false, (11 | u, 0))?
+            };
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -6946,6 +6964,110 @@ mod tests {
         assert_eq!(direct.root_uavs, [2]);
         assert_eq!(spilled.root_uavs, [2]);
         assert_eq!(spilled.dxil, direct.dxil);
+    }
+
+    #[test]
+    fn spilled_constant_address_reads_as_a_raw_root_srv() {
+        let words = [
+            0x8701_FF01u32,
+            0x0000_00FF, // mask the spill table high word
+            0xF404_0100,
+            0xFA00_0000, // load the input address into s4:s5
+            0xF404_0200,
+            0xFA00_0008, // load the destination UAV into s8:s9
+            0xF400_0280,
+            0xFA00_0010, // load ordinary numeric data into s10
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF400_0182,
+            0xFA00_0004, // s_load_dword s6, s[4:5], 4
+            0xF400_01C2,
+            0xFA00_000C, // s_load_dword s7, s[4:5], 12
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8906_0706, // s_xor_b32 s6, s6, s7
+            0x8906_0A06, // s_xor_b32 s6, s6, s10
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xDC70_8000,
+            0x0008_0100, // global_store_dword v0, v1, s[8:9]
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            S_ENDPGM,
+        ];
+        let make = |words: &[u32], input_kind, input_size| {
+            let mut used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 1,
+                stride: 0,
+                dwords: 2,
+                user_data: 18,
+                slot: 1,
+            }];
+            if input_kind == RootType::Descriptor {
+                used.push(UsedResource {
+                    kind: ResourceType::Srv,
+                    user_data: 16,
+                    slot: 0,
+                    lower_bound: 0,
+                    ..used[0]
+                });
+            }
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![
+                    RootParam {
+                        sgprs: input_size,
+                        ..root(input_kind, 16, 0)
+                    },
+                    root(RootType::Descriptor, 18, 1),
+                    root(RootType::Constants, 20, 2),
+                ],
+                used,
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 4 << 1,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build_with(&native.code, false, native.vgprs, true)?;
+            let res = resource::track(&p, &native.layout, native.stage)?;
+            let io = io::raise(&p, &native)?;
+            let st = structure::structure(&p)?;
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+        let actual = make(&words, RootType::Constants, 2).unwrap();
+        let reference = make(&words, RootType::Descriptor, 2).unwrap();
+        assert_eq!(actual.root_constant_srvs, [(0, 16)]);
+        assert_eq!(actual.root_srvs, [0]);
+        assert_eq!(actual.root_uavs, [1]);
+        assert_eq!(
+            actual
+                .user_data
+                .iter()
+                .map(|u| (u.slot, u.dword))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 1), (2, 0)]
+        );
+        assert_eq!(actual.root_srvs, reference.root_srvs);
+        assert_eq!(actual.root_uavs, reference.root_uavs);
+        assert!(reference.root_constant_srvs.is_empty());
+        assert!(make(&words, RootType::Constants, 1).is_err());
+
+        let mut unaligned = words;
+        unaligned[10] = 0xFA00_0002;
+        assert!(make(&unaligned, RootType::Constants, 2).is_err());
     }
 
     #[test]

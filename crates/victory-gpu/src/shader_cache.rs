@@ -131,7 +131,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -210,6 +210,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.root_constant_srvs.len() as u32);
+    for &(slot, bytes) in &s.root_constant_srvs {
+        word(&mut out, u32::from(slot));
+        word(&mut out, bytes);
+    }
     out
 }
 
@@ -267,6 +272,16 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let n = r.word()? as usize;
+    let mut root_constant_srvs = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        let slot = u8::try_from(r.word()?).ok()?;
+        let bytes = r.word()?;
+        if stage != HwStage::Cs || !root_srvs.contains(&slot) || bytes == 0 {
+            return None;
+        }
+        root_constant_srvs.push((slot, bytes));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -276,6 +291,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        root_constant_srvs,
     })
 }
 
@@ -285,7 +301,7 @@ mod tests {
 
     fn shader() -> HostShader {
         HostShader {
-            stage: HwStage::Ps,
+            stage: HwStage::Cs,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
@@ -303,6 +319,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            root_constant_srvs: vec![(3, 16)],
         }
     }
 
@@ -327,7 +344,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);

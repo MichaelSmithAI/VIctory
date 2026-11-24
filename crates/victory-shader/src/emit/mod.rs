@@ -154,6 +154,8 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Inferred raw SRVs from constant slots and the required mapped bytes.
+    pub root_constant_srvs: Vec<(u8, u32)>,
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
@@ -307,6 +309,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_constant_srvs: l.root_constant_srvs,
         root_uavs: l.root_uavs,
     })
 }
@@ -502,6 +505,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_constant_srvs: Vec::new(),
             root_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -513,6 +517,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_constant_srvs: Vec::new(),
                 root_uavs: Vec::new(),
             })
         };
