@@ -426,6 +426,16 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Whether an already written texture descriptor has a resource behind it.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn slot_has_resource(&self, index: u32) -> Option<bool> {
+        self.kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .map(Option::is_some)
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
