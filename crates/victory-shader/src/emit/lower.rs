@@ -38,6 +38,7 @@ pub(crate) struct Lowered {
     pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    pub table_reads: Vec<super::TableRead>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -177,6 +178,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Table entries descriptors are loaded from: (user data, dword) and
+    /// whether the offset is only known at run time.
+    table_reads: std::collections::BTreeSet<(u8, u32, bool)>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -490,6 +494,7 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            table_reads: std::collections::BTreeSet::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1017,7 +1022,36 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            table_reads: self
+                .table_reads
+                .iter()
+                .map(|&(user_data, dword, dynamic)| super::TableRead {
+                    user_data,
+                    dword,
+                    dynamic,
+                })
+                .collect(),
         })
+    }
+
+    /// Records the table entry a view descriptor load reads (see
+    /// [`super::TableRead`]); sampler tables have 16-byte entries and are
+    /// left out.
+    fn note_table_read(&mut self, load: Site, first: u8, per_lane: bool) {
+        let Some(a) = self.scalar.get(&load) else {
+            return;
+        };
+        let Some(rp) = self.x.native.layout.get(a.param) else {
+            return;
+        };
+        if rp.root != RootType::Table {
+            return;
+        }
+        // The tracker folds the base's displacement and a constant soffset
+        // into `offset`; what it could not fold is `dynamic`.
+        let dynamic = per_lane || a.dynamic.is_some();
+        let dword = a.offset / 4 + u32::from(first);
+        self.table_reads.insert((rp.user_data, dword, dynamic));
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -3892,6 +3926,10 @@ impl<'a> Lower<'a> {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
+        // Each lane's own address: known only at run time.
+        if !sampler {
+            self.note_table_read(load, first, true);
+        }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
@@ -3943,6 +3981,11 @@ impl<'a> Lower<'a> {
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
+        }
+        // A waterfall loop's load reads each lane's own entry.
+        let per_lane = self.x.res.waterfall.loads.contains(&load);
+        if !sampler {
+            self.note_table_read(load, first, per_lane);
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {
@@ -7834,6 +7877,88 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    /// Loads of later entries of a table range the used list names by its
+    /// first are reported (fixed and run-time offsets), for the host to
+    /// make their slots.
+    #[test]
+    fn table_entries_past_the_named_one_are_reported() {
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let tail = [
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xE030_2000,
+            0x8003_0200, // buffer_load_dword v2, v0, s[12:15], 0 idxen
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let fixed: Vec<u32> = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0040, // s_load_dwordx4 s[12:15], s[4:5], 0x40 (entry 2)
+        ]
+        .into_iter()
+        .chain(tail)
+        .collect();
+        let l = lower_with(&fixed, layout(), used()).unwrap();
+        let reads: Vec<_> = l.table_reads.iter().map(|t| (t.user_data, t.dword, t.dynamic)).collect();
+        assert_eq!(reads, [(0, 0, false), (0, 16, false)]);
+        // A displaced base plus a constant soffset: still a fixed entry.
+        let constant_soffset: Vec<u32> = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x8104_A004, // s_add_u32 s4, s4, 32 (entry 1)
+            0x8205_8005, // s_addc_u32 s5, s5, 0
+            0xBE86_03A0, // s_mov_b32 s6, 32
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0 (entry 1)
+            0xF408_0302,
+            0x0C00_0000, // s_load_dwordx4 s[12:15], s[4:5], s6 (entry 2)
+        ]
+        .into_iter()
+        .chain(tail)
+        .collect();
+        let l = lower_with(&constant_soffset, layout(), used()).unwrap();
+        let reads: Vec<_> = l.table_reads.iter().map(|t| (t.user_data, t.dword, t.dynamic)).collect();
+        assert_eq!(reads, [(0, 8, false), (0, 16, false)]);
+        // The second entry at an offset from user data (s1): run time.
+        let dynamic: Vec<u32> = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0x0200_0000, // s_load_dwordx4 s[12:15], s[4:5], s1
+        ]
+        .into_iter()
+        .chain(tail)
+        .collect();
+        match lower_with(&dynamic, layout(), used()) {
+            Ok(l) => {
+                let reads: Vec<_> = l.table_reads.iter().map(|t| (t.dword, t.dynamic)).collect();
+                assert!(reads.contains(&(0, false)) && reads.iter().any(|r| r.1), "{reads:?}");
+            }
+            // Not every run-time offset translates; then nothing is reported.
+            Err(e) => eprintln!("run-time table offset not translated: {e}"),
+        }
     }
 
     #[test]

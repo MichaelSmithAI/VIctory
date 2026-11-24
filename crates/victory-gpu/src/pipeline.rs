@@ -148,7 +148,63 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             .unwrap_or_default(),
         None => Vec::new(),
     };
+    let used = with_table_reads(used, &host.table_reads);
     Ok(Translated { host, used })
+}
+
+/// `used` (the console's list, which names a table range by its first
+/// entry) with a row for each later entry of a range the program loads a
+/// descriptor from at a fixed offset (descriptor arrays): draws make and
+/// refresh host slots only for listed entries. A load at an offset known
+/// only at run time is reported once; its entries are not listed.
+#[cfg(windows)]
+pub(crate) fn with_table_reads(
+    mut used: Vec<victory_shader::UsedResource>,
+    reads: &[victory_shader::emit::TableRead],
+) -> Vec<victory_shader::UsedResource> {
+    use victory_shader::RootType;
+    let named = used.len();
+    for read in reads {
+        // The range it falls in, as the translator picks it.
+        let Some(range) = used[..named]
+            .iter()
+            .filter(|u| {
+                u.root == RootType::Table
+                    && u.user_data == read.user_data
+                    && u.table_offset_dwords <= read.dword
+            })
+            .max_by_key(|u| u.table_offset_dwords)
+            .copied()
+        else {
+            continue;
+        };
+        if read.dynamic {
+            if read.dword / 8 >= range.table_offset_dwords / 8 {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        user_data = read.user_data,
+                        dword = read.dword,
+                        "a descriptor table read at a run-time offset: entries past the named one get no host slot"
+                    );
+                });
+            }
+            continue;
+        }
+        // Same host slot (32 bytes, 8 dwords) as a listed entry: nothing new.
+        let slot = read.dword / 8;
+        if used
+            .iter()
+            .any(|u| u.root == RootType::Table && u.user_data == read.user_data && u.table_offset_dwords / 8 == slot)
+        {
+            continue;
+        }
+        used.push(victory_shader::UsedResource {
+            table_offset_dwords: slot * 8,
+            ..range
+        });
+    }
+    used
 }
 
 #[repr(C)]
@@ -506,6 +562,7 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// Tests: a compute pipeline around an already translated shader.
 #[cfg(all(test, windows))]
 pub(crate) fn test_compute_pipeline(
     host: victory_shader::emit::HostShader,
@@ -513,6 +570,12 @@ pub(crate) fn test_compute_pipeline(
 ) -> This {
     let hash = blake3::hash(&host.dxil).to_hex()[..16].to_owned();
     let translated = OnceLock::new();
+    // Red/green control: `VICTORY_TEST_NO_TABLE_READS` keeps the console's list as is.
+    let used = if std::env::var_os("VICTORY_TEST_NO_TABLE_READS").is_some() {
+        used
+    } else {
+        with_table_reads(used, &host.table_reads)
+    };
     let _ = translated.set(Some(Translated { host, used }));
     let shader = Arc::new(Shader {
         stage: "compute",

@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, TableRead, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -131,7 +131,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -210,6 +210,12 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.table_reads.len() as u32);
+    for t in &s.table_reads {
+        for v in [u32::from(t.user_data), t.dword, u32::from(t.dynamic)] {
+            word(&mut out, v);
+        }
+    }
     out
 }
 
@@ -267,6 +273,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let n = r.word()? as usize;
+    let mut table_reads = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        table_reads.push(TableRead {
+            user_data: u8::try_from(r.word()?).ok()?,
+            dword: r.word()?,
+            dynamic: r.word()? != 0,
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -276,6 +291,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        table_reads,
     })
 }
 
@@ -303,6 +319,11 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            table_reads: vec![TableRead {
+                user_data: 2,
+                dword: 8,
+                dynamic: true,
+            }],
         }
     }
 

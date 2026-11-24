@@ -404,6 +404,12 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Tests: whether host slot `index` was made from a title view.
+    #[cfg(test)]
+    pub(crate) fn test_made(&self, index: u32) -> bool {
+        self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(|&k| k != 0)
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
