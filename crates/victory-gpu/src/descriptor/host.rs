@@ -613,10 +613,13 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         once!(view, own, "view format of another family");
         return false;
     }
-    if let Some(format) = format
-        && !typeless
-    {
-        *format = d.Format;
+    if let Some(format) = format {
+        if !typeless {
+            *format = d.Format;
+        } else if own == DXGI_FORMAT_R8G8B8A8_TYPELESS.0 as u32 && format.0 as u32 == own {
+            // The console uses this color view without specifying a component type.
+            *format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
     }
     true
 }
@@ -972,5 +975,110 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn typeless_rgba8_uav_clears_through_the_remapped_view() {
+        let Some(host) = host() else { return };
+        let null = std::ptr::null();
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2,
+            Height: 2,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 4, 15, 0xad],
+        );
+        let mut resource = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const props).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                &iid,
+                &mut resource,
+            ),
+            0
+        );
+        let texture = crate::resource::host_resource(resource).unwrap();
+        let view = View::Unordered(resource as usize, 0, Some([27, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        let mut format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        assert!(fits(texture, Some(&mut format), true));
+        assert_eq!(format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let visible = HostHeap::new(false, 1).unwrap();
+        let cpu: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let cpu_handle = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
+        assert_eq!(make(&view, cpu_handle), Some(Some(texture.clone())));
+        visible.make_at(0, &view);
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(
+            &list,
+            resource,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
+        );
+        // SAFETY: both descriptors name the same compatible RGBA8 UNORM view.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(visible.heap.clone())]);
+            list.list.ClearUnorderedAccessViewFloat(
+                visible.heap.GetGPUDescriptorHandleForHeapStart(),
+                cpu_handle,
+                texture,
+                &[0.0, 1.0, 0.25, 1.0],
+                &[],
+            );
+        }
+        crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, footprint) =
+            crate::capture::read_back(&host.device, &list.list, texture).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy has completed and the mapped footprint contains both rows.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            for row in 0..2 {
+                let start = mapped
+                    .cast::<u8>()
+                    .add(footprint.Offset as usize + row * footprint.Footprint.RowPitch as usize);
+                assert_eq!(
+                    std::slice::from_raw_parts(start, 8),
+                    &[0, 255, 64, 255, 0, 255, 64, 255]
+                );
+            }
+            readback.Unmap(0, None);
+        }
+        let release =
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(resource, 0x10);
+        assert_eq!(release(resource), 0);
     }
 }
