@@ -417,7 +417,19 @@ impl HostPipeline {
                 },
             )
         };
-        if compute.is_some() {
+        if let Some(cs) = compute {
+            let required_wave = cs.translated().and_then(|t| t.host.required_wave_size());
+            if let (Some(req), Some((_, max))) = (required_wave, host.wave_lanes)
+                && req > max
+            {
+                tracing::warn!(
+                    ?shaders,
+                    required_wave = req,
+                    device_max = max,
+                    "compute shader requires wave{req} but host GPU supports up to wave{max}: skipping pipeline creation"
+                );
+                return None;
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },

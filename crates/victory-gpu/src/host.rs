@@ -37,6 +37,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) wave_lanes: Option<(u32, u32)>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -207,9 +208,14 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let wave_lanes = crate::device::query_wave_lane_limits(&device);
+        if let Some((min, max)) = wave_lanes {
+            tracing::info!(min, max, "host wave lane limits");
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
+            wave_lanes,
             queue,
             fence,
             submitted: Mutex::new(0),

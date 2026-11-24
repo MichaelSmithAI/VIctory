@@ -159,6 +159,21 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    /// The fixed wave size declared by the emitted DXIL, if any.
+    pub fn required_wave_size(&self) -> Option<u32> {
+        let container = Container::parse(&self.dxil).ok()?;
+        let psv = container.part(FourCC::PSV0)?.data;
+        let info_size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?);
+        if info_size < 24 {
+            return None;
+        }
+        // The runtime info follows its size word. The wave range starts
+        // at byte 16 of that info.
+        let min = u32::from_le_bytes(psv.get(20..24)?.try_into().ok()?);
+        let max = u32::from_le_bytes(psv.get(24..28)?.try_into().ok()?);
+        (min != 0 && min == max).then_some(min)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -483,6 +498,26 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    #[test]
+    fn required_wave_size_reads_the_emitted_constraint() {
+        for wave_size in [None, Some(32), Some(64)] {
+            let mut shader = Shader::new(false);
+            shader.threads = Some([64, 1, 1]);
+            shader.wave_size = wave_size;
+            shader.m.terminate(shader.entry, super::bitcode::Term::Ret);
+            let host = HostShader {
+                stage: HwStage::Cs,
+                dxil: shader.finish(),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+            };
+            assert_eq!(host.required_wave_size(), wave_size);
+        }
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
