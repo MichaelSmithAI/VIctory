@@ -347,7 +347,9 @@ impl State {
             );
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -406,7 +408,7 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -447,6 +449,7 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let mut alias_leases = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             let made = self.tables(list, &t.used, compute);
@@ -492,24 +495,68 @@ impl State {
                 }
             }
             if let Some(param) = stage.stride_table {
-                let gpu = (self.heaps[0] != 0)
-                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                    .flatten()
-                    .and_then(|h| h.stride_table_gpu());
-                if let Some(gpu) = gpu {
-                    // SAFETY: an open list; the stride table buffer lives with the host heap.
-                    unsafe {
-                        if compute {
-                            l.SetComputeRootShaderResourceView(param, gpu);
-                        } else {
-                            l.SetGraphicsRootShaderResourceView(param, gpu);
-                        }
+                let Some((gpu, lease)) =
+                    self.structured_read_aliases(list, &t.host.stride_table, compute)
+                else {
+                    for (heap, first, count) in alias_leases {
+                        crate::descriptor::release_dynamic(heap, first, count);
                     }
-                } else {
-                    once!("a shader reads the runtime stride table without a host view heap");
+                    once!("cannot bind a runtime-stride structured SRV");
+                    return false;
+                };
+                alias_leases.push(lease);
+                // SAFETY: this immutable table lives until the list retires.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
                 }
             }
         }
+        self.dynamic.extend(alias_leases);
+        true
+    }
+
+    fn structured_read_aliases(
+        &self,
+        list: &HostList,
+        entries: &[(u8, u32)],
+        compute: bool,
+    ) -> Option<(u64, (usize, u32, u32))> {
+        let address = self.heaps[0];
+        if address == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(address as This);
+        let host = heap.host()?;
+        let n = u32::try_from(entries.len()).ok()?;
+        let (gpu, ptr) = list.scratch(u64::from(n) * 16)?;
+        let views = entries
+            .iter()
+            .map(|&(slot, dword)| {
+                let Root::Table(table) = *self.roots_ref(compute).get(usize::from(slot))? else {
+                    return None;
+                };
+                let handle = table.checked_add(u64::from(dword) * 4)?;
+                if !std::ptr::eq(heap, self.heap_of(handle)?) {
+                    return None;
+                }
+                crate::descriptor::view(handle)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let first = host.dynamic(n)?;
+        for (i, view) in views.iter().enumerate() {
+            let Some(row) = host.structured_read_alias(first + i as u32, view, list) else {
+                // No command references this lease until every row is bound.
+                host.release(first, n);
+                return None;
+            };
+            // SAFETY: allocated four dwords for each entry above.
+            unsafe { ptr.cast::<[u32; 4]>().add(i).write(row) };
+        }
+        Some((gpu, (std::ptr::from_ref(heap) as usize, first, n)))
     }
 
     /// Runs a dispatch on the host.
@@ -534,7 +581,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -1009,10 +1059,7 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,

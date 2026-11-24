@@ -131,7 +131,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -210,7 +210,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
-    word(&mut out, u32::from(s.stride_table));
+    word(&mut out, s.stride_table.len() as u32);
+    for &(slot, dword) in &s.stride_table {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -267,7 +271,16 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
-    let stride_table = r.word()? != 0;
+    let count = r.word()?;
+    let mut stride_table = Vec::new();
+    for _ in 0..count {
+        let slot = u8::try_from(r.word()?).ok()?;
+        let dword = r.word()?;
+        if !dword.is_multiple_of(8) || stride_table.contains(&(slot, dword)) {
+            return None;
+        }
+        stride_table.push((slot, dword));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -303,7 +316,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
-            stride_table: true,
+            stride_table: vec![(0, 8)],
         }
     }
 

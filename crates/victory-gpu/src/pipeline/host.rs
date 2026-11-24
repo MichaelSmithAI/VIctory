@@ -393,7 +393,7 @@ impl HostPipeline {
                     });
                 }
             }
-            if t.stride_table {
+            if !t.stride_table.is_empty() {
                 stage.stride_table = Some(params.len() as u32);
                 params.push(D3D12_ROOT_PARAMETER1 {
                     ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,

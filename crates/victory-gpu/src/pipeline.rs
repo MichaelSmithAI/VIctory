@@ -501,6 +501,28 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_compute_pipeline(
+    host: victory_shader::emit::HostShader,
+    used: Vec<victory_shader::UsedResource>,
+) -> This {
+    let hash = blake3::hash(&host.dxil).to_hex()[..16].to_owned();
+    let translated = OnceLock::new();
+    let _ = translated.set(Some(Translated { host, used }));
+    let shader = Arc::new(Shader {
+        stage: "compute",
+        hash,
+        container: Vec::new(),
+        translated,
+    });
+    let mut out = std::ptr::null();
+    assert_eq!(
+        hand_out(vec![shader], None, &PIPELINE_IIDS[0], &mut out),
+        crate::object::S_OK
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
