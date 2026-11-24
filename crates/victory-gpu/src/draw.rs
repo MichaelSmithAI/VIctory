@@ -1305,7 +1305,7 @@ mod tests {
         );
         let heap_start = slot::<extern "system" fn(This) -> u64>(heap_obj, 0x48)(heap_obj);
 
-        // Create a 4096-byte committed buffer so its shadow buffer is 256-byte aligned.
+        // Committed buffers have a 256-byte-aligned host address.
         let props = [2u32, 0, 0, 0, 0]; // UPLOAD heap
         let buf_desc = [
             1u32, // BUFFER
@@ -1323,7 +1323,9 @@ mod tests {
             0,
             0,
         ];
-        let make_buffer = || {
+        let make_buffer = |width| {
+            let mut buf_desc = buf_desc;
+            buf_desc[4] = width;
             let mut buf: This = null;
             let res_iid = ID3D12Resource::IID;
             assert_eq!(
@@ -1341,9 +1343,9 @@ mod tests {
             );
             buf
         };
-        let buf = make_buffer();
+        let buf = make_buffer(3840 + 128);
         let (data, len) = crate::resource::buffer_bytes(buf).expect("buffer bytes");
-        assert!(len >= 4096);
+        assert_eq!(len, 3840 + 128);
         let base = data as u64;
 
         let write_cbv = |slot_idx: u64, addr: u64, size: u32| {
@@ -1355,7 +1357,7 @@ mod tests {
         // Slot 1: 16-byte aligned (misaligned for PC) CBV -> needs dynamic slots.
         write_cbv(1, base + 16, 256);
         // Slot 2: 256-byte aligned start, but padded 256-byte size runs past shadow end -> needs dynamic slots.
-        write_cbv(2, base + 4096 - 128, 128);
+        write_cbv(2, base + 3840, 128);
 
         let used = [UsedResource {
             kind: ResourceType::Cbv,
@@ -1418,7 +1420,7 @@ mod tests {
         drop(state);
         drop(list);
 
-        let out = make_buffer();
+        let out = make_buffer(4096);
         let (output, _) = crate::resource::buffer_bytes(out).unwrap();
         let uav: [u32; 10] = [0, 1, 0, 0, 64, 4, 0, 0, 0, 0];
         crate::descriptor::create_uav(null, out, null, &uav, heap_start + 3 * 32);
