@@ -56,8 +56,19 @@ pub fn argument_clamp() -> Vec<u8> {
     let budget = s.root_uav_handle(BUDGET);
     let id = s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[zero]);
 
-    let [body, draw, other, dispatch, mesh, join, empty, exit] =
-        std::array::from_fn(|_| s.m.new_block());
+    let [
+        body,
+        draw,
+        other,
+        dispatch,
+        mesh,
+        join,
+        retry,
+        reserve,
+        accepted,
+        empty,
+        exit,
+    ] = std::array::from_fn(|_| s.m.new_block());
     let live = s.m.cmp(entry, pred::IULT, id, records);
     s.m.terminate(entry, Term::CondBr(live, body, exit));
 
@@ -138,21 +149,39 @@ pub fn argument_clamp() -> Vec<u8> {
         ],
     );
     let undef = s.m.undef(i32t);
-    // Adds the cost and returns the budget's value before it.
-    let before = s.op(
+    // Read atomically, then reserve up to the remaining budget. A failed
+    // reservation retries with the current value returned by the exchange.
+    let initial = s.op(
         join,
         "atomicBinOp.i32",
         Attr::NoUnwind,
         i32t,
         78,
-        &[budget, zero, zero, undef, undef, cost],
+        &[budget, zero, zero, undef, undef, zero],
     );
+    s.m.terminate(join, Term::Br(retry));
+
+    let before = s.m.phi(retry, i32t);
     let list = s.m.i32(LIST);
-    let spent = s.m.cmp(join, pred::IUGE, before, list);
-    let after = s.m.bin(join, Bin::Add, before, cost);
-    let past = s.m.cmp(join, pred::IUGT, after, list);
-    let over = s.m.bin(join, Bin::Or, spent, past);
-    s.m.terminate(join, Term::CondBr(over, empty, exit));
+    let spent = s.m.cmp(retry, pred::IUGE, before, list);
+    s.m.terminate(retry, Term::CondBr(spent, empty, reserve));
+
+    let remaining = s.m.bin(reserve, Bin::Sub, list, before);
+    let fits = s.m.cmp(reserve, pred::IULE, cost, remaining);
+    let charged = s.m.select(reserve, fits, cost, remaining);
+    let after = s.m.bin(reserve, Bin::Add, before, charged);
+    let observed = s.op(
+        reserve,
+        "atomicCompareExchange.i32",
+        Attr::NoUnwind,
+        i32t,
+        79,
+        &[budget, zero, undef, undef, before, after],
+    );
+    s.m.set_phi(before, vec![(initial, join), (observed, reserve)]);
+    let success = s.m.cmp(reserve, pred::EQ, observed, before);
+    s.m.terminate(reserve, Term::CondBr(success, accepted, retry));
+    s.m.terminate(accepted, Term::CondBr(fits, exit, empty));
 
     // Draws keep their layout with no vertices; groups become zero.
     store(&mut s, empty, args, at, 0, zero);
@@ -387,9 +416,20 @@ mod tests {
             let (data, budget) = run(&host, 0, &[[100, 3, 7]], spent);
             let first = if emptied { 0 } else { 100 };
             assert_eq!(data[..4], [first, 3, 7, MARK], "budget at {spent:#x}");
-            // The cost is added either way.
-            assert_eq!(budget, spent + 300, "budget at {spent:#x}");
+            // The cost is charged up to the budget.
+            assert_eq!(budget, LIST, "budget at {spent:#x}");
         }
+        // Competing lanes may reserve in any order, but can admit only
+        // three of these one-vertex records. Only the clamp is dispatched.
+        let (data, budget) = run(&host, 0, &[[1, 1, 7]; 8], LIST - 3);
+        assert_eq!(budget, LIST);
+        let mut admitted = data[..8 * STRIDE]
+            .chunks_exact(STRIDE)
+            .map(|record| record[0])
+            .collect::<Vec<_>>();
+        admitted.sort_unstable();
+        assert_eq!(admitted, [0, 0, 0, 0, 0, 1, 1, 1]);
+
         // A dispatch past the budget loses its first dimension.
         let (data, _) = run(&host, 2, &[[4, 4, 4]], LIST);
         assert_eq!(data[..4], [0, 4, 4, MARK]);
