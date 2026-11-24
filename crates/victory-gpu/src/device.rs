@@ -511,6 +511,39 @@ mod tests {
     }
 
     #[test]
+    fn feature_queries_use_the_guest_profile() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+
+        let mut options = [u32::MAX; 16];
+        assert_eq!(
+            check(device, 0, options.as_mut_ptr().cast(), 60),
+            E_INVALIDARG
+        );
+        assert_eq!(options, [u32::MAX; 16]);
+        assert_eq!(check(device, 0, options.as_mut_ptr().cast(), 64), S_OK);
+        assert_eq!(options, [1, 1, 2, 3, 3, 1, 1, 1, 3, 40, 0, 0, 0, 0, 1, 2]);
+
+        let mut architecture = [0, u32::MAX, u32::MAX, u32::MAX];
+        assert_eq!(check(device, 1, architecture.as_mut_ptr().cast(), 16), S_OK);
+        assert_eq!(architecture, [0, 0, 1, 1]);
+        architecture[0] = 1;
+        assert_eq!(
+            check(device, 1, architecture.as_mut_ptr().cast(), 16),
+            E_INVALIDARG
+        );
+        assert_eq!(architecture, [1, 0, 1, 1]);
+
+        const RGBA8_UNORM: u32 = 28;
+        for (samples, levels) in [(1, 1), (2, 1), (3, 0), (4, 1), (8, 1), (16, 0)] {
+            let mut query = [RGBA8_UNORM, samples, 0, u32::MAX];
+            assert_eq!(check(device, 4, query.as_mut_ptr().cast(), 16), S_OK);
+            assert_eq!(query, [RGBA8_UNORM, samples, 0, levels]);
+        }
+    }
+
+    #[test]
     fn feature_levels_pick_the_highest_supported() {
         type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
         let device = device();
