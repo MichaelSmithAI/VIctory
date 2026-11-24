@@ -1066,6 +1066,62 @@ mod tests {
         assert_eq!(slot::<Release>(image, 0x10)(image), 0);
     }
 
+    #[test]
+    fn a_pre_recorded_reader_preserves_the_submitted_texture_copy() {
+        let host = host().expect("D3D12 host");
+        let mut readbacks = Vec::new();
+        for record_reader_early in [false, true] {
+            let mut backing = vec![0u8; 64 << 10];
+            let mem = backing.as_mut_ptr();
+            let image = test_texture_at(mem as u64, u64::from(W), H, RGBA8, 0);
+            let (_, desc) = texture_memory(image).expect("texture memory");
+            let len = texture_layout(&desc).expect("layout").planes[0].layout.size as usize;
+            write_tiled(image, mem, len, &pattern(0x10));
+            run_upload(host, image);
+
+            let expected = pattern(0x70);
+            let (writer_queue, writer_allocator, writer) = make_queue_and_list();
+            let src = record_buffer_to_texture(writer, image, &expected);
+            let record_reader = || {
+                let (queue, allocator, reader) = make_queue_and_list();
+                let list = crate::list::host_list(reader).expect("host list");
+                upload(list, image, host_resource(image).expect("host texture"));
+                assert_eq!(
+                    slot::<extern "system" fn(This) -> HRESULT>(reader, 0x48)(reader),
+                    S_OK
+                );
+                (queue, allocator, reader)
+            };
+            let reader = record_reader_early.then(record_reader);
+            let execute = slot::<extern "system" fn(This, u32, *const This)>(writer_queue, 0x50);
+            execute(writer_queue, 1, &writer);
+            assert_rows_eq(&read_back(host, image), &expected, "producer");
+            let (reader_queue, reader_allocator, reader) = reader.unwrap_or_else(record_reader);
+            execute(reader_queue, 1, &reader);
+            let actual = read_back(host, image);
+            println!(
+                "reader recorded early={record_reader_early}, first byte={:02x}",
+                actual[0]
+            );
+            readbacks.push(actual);
+            for object in [
+                reader,
+                reader_allocator,
+                reader_queue,
+                writer,
+                src,
+                writer_allocator,
+                writer_queue,
+                image,
+            ] {
+                assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+            }
+        }
+        let expected = pattern(0x70);
+        assert_rows_eq(&readbacks[0], &expected, "reader recorded late");
+        assert_rows_eq(&readbacks[1], &expected, "reader recorded early");
+    }
+
     /// Releasing a texture after recording a copy but before submitting its
     /// list must not leave a stale `HOST_WRITTEN` entry behind.
     #[test]
