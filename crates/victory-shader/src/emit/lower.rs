@@ -607,7 +607,8 @@ impl<'a> Lower<'a> {
                 words: [0, 0],
             };
             let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
-            let root_ok = self.root_view_size(&src)
+            let root_ok = self
+                .root_view_size(&src)
                 .map(|size| self.in_root_view(size, off, 4 * n).0);
             let guard = self.narrow(guard, root_ok);
             let iu = self.s.m.undef(self.s.t.i32);
@@ -6193,13 +6194,14 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
+        let ushort = plain == "buffer_load_ushort";
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() => (false, 1),
-            Some("dword") => (false, 1),
+            Some("dword" | "ushort") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
             Some("dwordx4") => (false, 4),
@@ -6244,6 +6246,9 @@ impl<'a> Lower<'a> {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+            if ushort {
+                return Err(name);
+            }
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
@@ -6300,13 +6305,72 @@ impl<'a> Lower<'a> {
                     }
                     _ => (off, index, None),
                 };
-                let (ok, _) = self.in_root_view(size, off, bytes);
+                let ok = if ushort {
+                    // Both bytes must fit, including their aligned DXIL dword loads.
+                    let one = self.s.m.i32(1);
+                    let mask = self.s.m.i32(!3);
+                    let last = self.s.m.bin(c, Bin::Add, off, one);
+                    let aligned = self.s.m.bin(c, Bin::And, last, mask);
+                    let (fits, _) = self.in_root_view(size, aligned, 4);
+                    let no_wrap = self.s.m.cmp(c, pred::IUGE, last, off);
+                    self.s.m.bin(c, Bin::And, fits, no_wrap)
+                } else {
+                    self.in_root_view(size, off, bytes).0
+                };
                 let ok = self.narrow(Some(ok), no_wrap).expect("root access bound");
                 let zero = self.s.m.i32(0);
                 (self.s.m.select(c, ok, off, zero), index, Some(ok))
             }
             _ => (off, index, None),
         };
+        if ushort {
+            let Some(root_ok) = root_ok else {
+                return Err(name);
+            };
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let access = self.narrow(guard, Some(root_ok));
+            let outer = self.begin_guarded(access);
+            let c = self.cur;
+            let three = self.s.m.i32(3);
+            let bytes = self.s.m.bin(c, Bin::And, off, three);
+            let bitmask = self.s.m.i32(!3);
+            let aligned = self.s.m.bin(c, Bin::And, off, bitmask);
+            let eight = self.s.m.i32(8);
+            let shift = self.s.m.bin(c, Bin::Mul, bytes, eight);
+            let read = |l: &mut Self, offset| {
+                let mask = l.s.m.i8(1);
+                let align = l.s.m.i32(4);
+                let r = l.s.op(
+                    l.cur,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    l.s.t.res_ret,
+                    139,
+                    &[h, offset, iu, mask, align],
+                );
+                let x = l.s.m.extract(l.cur, r, 0);
+                l.as_int(x)
+            };
+            let first = read(self, aligned);
+            let lo = self.s.m.bin(c, Bin::LShr, first, shift);
+            let split = self.s.m.cmp(c, pred::EQ, bytes, three);
+            let inner = self.begin_guarded(Some(split));
+            let four = self.s.m.i32(4);
+            let next = self.s.m.bin(self.cur, Bin::Add, aligned, four);
+            let high = read(self, next);
+            let high = self.s.m.bin(self.cur, Bin::Shl, high, eight);
+            let both = self.s.m.bin(self.cur, Bin::Or, lo, high);
+            let joined = self.end_guarded(inner, &[(both, lo)])[0];
+            let mask = self.s.m.i32(0xffff);
+            let value = self.s.m.bin(self.cur, Bin::And, joined, mask);
+            let zero = self.s.m.i32(0);
+            let value = self.end_guarded(outer, &[(value, zero)])[0];
+            self.write(inst, Reg::V(reg), value, guard);
+            return Ok(());
+        }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
@@ -6488,7 +6552,9 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         let zero = self.s.m.f32(0);
-        let loaded: Vec<_> = (0..count).map(|k| (self.s.m.extract(c, r, k), zero)).collect();
+        let loaded: Vec<_> = (0..count)
+            .map(|k| (self.s.m.extract(c, r, k), zero))
+            .collect();
         let values = self.end_guarded(at, &loaded);
         let c = self.cur;
         if d16 {

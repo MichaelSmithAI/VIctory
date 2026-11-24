@@ -1101,10 +1101,10 @@ fn structured_access_through_a_root_uav_reaches_index_times_stride() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-/// MUBUF `buffer_load_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen`.
-const fn buffer_load_dword_offen(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+/// MUBUF load with a vector byte offset and a four-SGPR descriptor.
+const fn buffer_load_offen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
     [
-        0x38 << 26 | 0x0C << 18 | 1 << 12,
+        0x38 << 26 | op << 18 | 1 << 12,
         0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
     ]
 }
@@ -1114,6 +1114,35 @@ const fn buffer_load_dword_offen(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
 /// memory after it (or an unmapped page, which some GPUs stall on).
 #[test]
 fn root_view_reads_stop_at_the_bound_size() {
+    root_view_reads(
+        0x0c,
+        &[
+            (0, 64, 0x100),
+            (60, 64, 0x10f),
+            (64, 64, 0),
+            (128, 64, 0),
+            (u32::MAX - 3, 64, 0),
+        ],
+    );
+}
+
+#[test]
+fn root_view_ushort_checks_aligned_dword_footprints() {
+    root_view_reads(
+        0x0a,
+        &[
+            (0, 64, 0x100),
+            (1, 64, 1),
+            (3, 64, 0x100),
+            (62, 64, 0),
+            (63, 64, 0),
+            (60, 63, 0),
+            (u32::MAX, 64, 0),
+        ],
+    );
+}
+
+fn root_view_reads(op: u32, samples: &[(u32, u32, u32)]) {
     // s0..s3 root constants, s4 the UAV table, s[8:9] the root SRV's address.
     let mut words = vec![s_mov_b32(5, 0x80)];
     words.extend_from_slice(&s_load_dwordx4(12, 4));
@@ -1121,7 +1150,7 @@ fn root_view_reads_stop_at_the_bound_size() {
     words.push(s_mov_b32(10, 0xC1));
     words.push(s_mov_b32(11, 0x80));
     words.push(vop1(0x001, 1, sgpr(0))); // v_mov_b32 v1, s0: the byte offset
-    words.extend_from_slice(&buffer_load_dword_offen(0, 1, 8));
+    words.extend_from_slice(&buffer_load_offen(op, 0, 1, 8));
     words.extend_from_slice(&buffer_store_dword(0, 12, 0));
     words.push(S_ENDPGM);
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -1210,18 +1239,12 @@ fn root_view_reads_stop_at_the_bound_size() {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        for (offset, want) in [
-            (0, 0x100),
-            (60, 0x10F),
-            (64, 0),
-            (128, 0),
-            (u32::MAX - 3, 0),
-        ] {
+        for &(offset, size, want) in samples {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
                 ud[u.index as usize] = match u.root {
                     RootType::Constants => offset,
-                    RootType::Descriptor => 64,
+                    RootType::Descriptor => size,
                     _ => 0,
                 };
             }
