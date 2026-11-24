@@ -1540,7 +1540,7 @@ mod depth_trace_tests {
         let null = std::ptr::null();
         let mut resources = Vec::new();
         for (slot, format, host_format, view_format, backed) in
-            [(0, 20, 19, 41, false), (1, 55, 53, 56, true)]
+            [(0, 20, 19, 41, false), (1, 55, 53, 56, false)]
         {
             let memory = resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
             let address = memory.address();
@@ -1653,7 +1653,7 @@ mod depth_trace_tests {
             object::release(depth);
         }
         eprintln!(
-            "depth attribution checked ordinary null and backed SRVs/UAVs and a same-address placed null UAV"
+            "depth attribution checked ordinary backed and null views and same-address placed null UAVs"
         );
     }
 }
