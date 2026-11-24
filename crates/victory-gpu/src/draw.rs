@@ -23,6 +23,9 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+#[cfg(feature = "diagnostics")]
+mod table_admission;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -74,6 +77,8 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    #[cfg(feature = "diagnostics")]
+    admission: Option<table_admission::Census>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -456,6 +461,10 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        #[cfg(feature = "diagnostics")]
+        if table_admission::enabled() {
+            self.admission.get_or_insert_with(table_admission::Census::new).begin();
+        }
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
@@ -469,6 +478,8 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
+                #[cfg(feature = "diagnostics")]
+                if let Some(census) = &mut self.admission { census.finish(false); }
                 return false;
             }
             if let Some((param, dwords)) = stage.user_data {
@@ -513,6 +524,8 @@ impl State {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        if let Some(census) = &mut self.admission { census.finish(true); }
         true
     }
 
@@ -714,6 +727,8 @@ impl State {
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
+                #[cfg(feature = "diagnostics")]
+                if let Some(census) = &mut self.admission { census.hit(key); }
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -730,11 +745,15 @@ impl State {
                 // a wild address on AMD and the device is removed (#59).
                 // The draw or dispatch is dropped instead.
                 self.table_failed = true;
+                #[cfg(feature = "diagnostics")]
+                if let Some(census) = &mut self.admission { census.miss(n); }
                 continue;
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
+            #[cfg(feature = "diagnostics")]
+            if let Some(census) = &mut self.admission { census.reserve(key, n); }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
