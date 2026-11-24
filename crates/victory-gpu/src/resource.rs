@@ -1427,6 +1427,22 @@ mod tests {
         let clear_float = slot::<Clear<f32>>(list, 0x1b0);
         clear_float(list, base + 192, base + 64, buffers[1], &[1.25; 4], 0, null.cast());
         clear_float(list, base + 224, base + 96, buffers[1], &[-2.5; 4], 0, null.cast());
+        let host_list = crate::list::host_list(list).unwrap();
+        let (readback, mapped) = host.shared_buffer(512).expect("GPU copy destination");
+        for (index, resource) in buffers.into_iter().enumerate() {
+            let (data, len) = buffer_bytes(resource).unwrap();
+            let base = data as u64;
+            let shadow = crate::shadow::find(base, len).unwrap();
+            shadow.refresh(host_list, base, len);
+            host_list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+            // SAFETY: live buffers, a tracked COPY_SOURCE and a common-state
+            // destination eligible for promotion. Both copy regions fit.
+            unsafe {
+                host_list.list.CopyBufferRegion(
+                    &readback, index as u64 * 256, &shadow.buffer, shadow.offset(base), 256,
+                );
+            }
+        }
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
         host.execute(&[crate::list::host_list(list).unwrap()]);
         slot::<Release>(list, 0x10)(list);
@@ -1442,7 +1458,11 @@ mod tests {
             // SAFETY: the completed list no longer writes the live allocation.
             let actual = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 64) };
             eprintln!("clear fixture {index} words: {:?}", &actual[..9]);
-            assert_eq!(actual, expected);
+            // SAFETY: the submitted copies have completed, and each slice
+            // lies within the 512 bytes of mapped GPU copy destination.
+            let copied = unsafe { std::slice::from_raw_parts(mapped.cast::<u32>().add(index * 64), 64) };
+            assert_eq!(actual, expected, "guest copyback");
+            assert_eq!(copied, expected, "same-list GPU copy after clear");
             slot::<Release>(resource, 0x10)(resource);
         }
         for heap in heaps {
