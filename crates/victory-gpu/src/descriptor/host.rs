@@ -529,6 +529,13 @@ fn buffer_srv(
     if buffer.FirstElement + u64::from(buffer.NumElements) > capacity {
         buffer.NumElements = (capacity - buffer.FirstElement) as u32;
     }
+    // A view of no elements is an invalid call too (the title's own record
+    // count can be 0): null, which reads 0 and drops writes.
+    if buffer.NumElements == 0 {
+        let first = buffer.FirstElement;
+        once!(first, "buffer view of no elements");
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -583,6 +590,13 @@ fn buffer_uav(
     }
     if buffer.FirstElement + u64::from(buffer.NumElements) > capacity {
         buffer.NumElements = (capacity - buffer.FirstElement) as u32;
+    }
+    // A view of no elements is an invalid call too (the title's own record
+    // count can be 0): null, which reads 0 and drops writes.
+    if buffer.NumElements == 0 {
+        let first = buffer.FirstElement;
+        once!(first, "buffer view of no elements");
+        return None;
     }
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
