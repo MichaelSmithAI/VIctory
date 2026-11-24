@@ -14,7 +14,7 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{EXEC, Inst, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Structured};
 
@@ -1317,7 +1317,7 @@ impl<'a> Tracer<'a> {
             if let Term::Value(v) = *w
                 && phi_of(w).is_none()
                 && let Some((d, _)) = self.defs[v.0 as usize]
-                && (d == block || self.reaches(block, d))
+                && (d == block || self.reaches(block, d, |b| b.exit.successors()))
             {
                 return Err("a descriptor partly joined by control flow");
             }
@@ -1367,9 +1367,9 @@ impl<'a> Tracer<'a> {
 
     /// Whether a path leads from block `from` to block `to` (to `from`
     /// itself only through a back edge).
-    fn reaches(&self, from: usize, to: usize) -> bool {
+    fn reaches(&self, from: usize, to: usize, successors: impl Fn(&Block) -> Vec<usize>) -> bool {
         let mut seen = vec![false; self.p.blocks.len()];
-        let mut stack = self.p.blocks[from].exit.successors();
+        let mut stack = successors(&self.p.blocks[from]);
         while let Some(x) = stack.pop() {
             if x == to {
                 return true;
@@ -1377,7 +1377,7 @@ impl<'a> Tracer<'a> {
             if std::mem::replace(&mut seen[x], true) {
                 continue;
             }
-            stack.extend(self.p.blocks[x].exit.successors());
+            stack.extend(successors(&self.p.blocks[x]));
         }
         false
     }
@@ -1506,7 +1506,24 @@ impl<'a> Tracer<'a> {
     /// Whether blocks `a` and `b` are in one loop: each reaches the other
     /// (a block reaches itself only through a back edge).
     fn same_loop(&self, a: usize, b: usize) -> bool {
-        self.reaches(a, b) && self.reaches(b, a)
+        let successors = |block: &Block| {
+            if let Exit::Branch { taken, not_taken } = block.exit
+                && let Some(branch) = block.insts.last()
+                && matches!(branch.name(), "s_cbranch_execz" | "s_cbranch_execnz")
+                && (0..=u8::from(self.p.wave64)).all(|word| {
+                    branch.read(Reg::S(EXEC + word)).map(|v| self.origin(v)) == Some(Term::Const(0))
+                })
+            {
+                // An empty EXEC has no lane that can repeat the access.
+                return vec![if branch.name() == "s_cbranch_execz" {
+                    taken
+                } else {
+                    not_taken
+                }];
+            }
+            block.exit.successors()
+        };
+        self.reaches(a, b, successors) && self.reaches(b, a, successors)
     }
 
     /// Consecutive dwords of one scalar load.

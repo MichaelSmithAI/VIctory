@@ -6988,6 +6988,45 @@ mod tests {
     }
 
     #[test]
+    fn joined_descriptor_loop_must_retry_nonmatching_lanes() {
+        use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let retry = words.iter_mut().find(|w| **w == 0x897E_157E).unwrap();
+        // Keep the descriptor comparisons and the CFG back edge, but
+        // terminate the loop after the first descriptor has been used.
+        *retry = 0xBEFE_0380; // s_mov_b32 exec_lo, 0
+        let (layout, used) = texture_and_uav_tables();
+        match lower_wave(&words, layout, used, false) {
+            Err(crate::ShaderError::Unsupported {
+                what: "a descriptor read from the first lane outside a waterfall loop",
+                ..
+            }) => {}
+            Err(err) => panic!("unexpected refusal: {err:?}"),
+            Ok(lowered) => panic!(
+                "accepted a dead retry and emitted {} nonuniform handle(s)",
+                lowered.nonuniform_handles
+            ),
+        }
+    }
+
+    #[test]
+    fn waterfall_retry_can_cross_blocks() {
+        use crate::resource::tests::WATERFALL_FETCHED_WAVE32;
+
+        let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
+        let select = words.iter().position(|&w| w == 0xBE95_3C15).unwrap();
+        assert_eq!(words[select + 1], 0xBF80_0000);
+        // Split the loop between the mask computation and the texture
+        // access, leaving every instruction and the back edge in place.
+        words[select + 1] = 0xBF82_0000; // s_branch to the next instruction
+        let (layout, used) = texture_tables();
+        let lowered = lower_wave(&words, layout, used, false).unwrap();
+        assert_eq!(lowered.nonuniform_handles, 1);
+        assert!(!lowered.wave_ops);
+    }
+
+    #[test]
     fn buffer_formats_by_number() {
         // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
         // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
