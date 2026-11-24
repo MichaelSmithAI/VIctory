@@ -167,7 +167,18 @@ mod tests {
 
     #[test]
     fn concurrent_publication_reuses_existing_entry_and_removes_staging() {
+        check_concurrent_publication(false);
+    }
+
+    #[test]
+    fn concurrent_publication_with_default_reader_sharing() {
+        check_concurrent_publication(true);
+    }
+
+    fn check_concurrent_publication(default_sharing: bool) {
         use std::sync::Mutex;
+        #[cfg(not(windows))]
+        let _ = default_sharing;
 
         /// Simulates a second worker publishing the target file while our
         /// `convert` is in flight, and (on Windows) holding it open without
@@ -175,6 +186,8 @@ mod tests {
         struct Racing {
             target: PathBuf,
             held: Mutex<Option<std::fs::File>>,
+            #[cfg(windows)]
+            default_sharing: bool,
         }
 
         impl Converter for Racing {
@@ -193,10 +206,14 @@ mod tests {
                     use std::os::windows::fs::OpenOptionsExt;
                     // FILE_SHARE_READ (1) without FILE_SHARE_DELETE forces
                     // `std::fs::rename` over `target` to fail on Windows.
-                    let reader = std::fs::OpenOptions::new()
-                        .read(true)
-                        .share_mode(1)
-                        .open(&self.target)?;
+                    let reader = if self.default_sharing {
+                        std::fs::File::open(&self.target)?
+                    } else {
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(1)
+                            .open(&self.target)?
+                    };
                     *self.held.lock().unwrap() = Some(reader);
                 }
                 Ok(bytes)
@@ -208,11 +225,15 @@ mod tests {
         let probe = Racing {
             target: PathBuf::new(),
             held: Mutex::new(None),
+            #[cfg(windows)]
+            default_sharing,
         };
         let target = cache.path_for(&CacheKey::new(&probe, b"race"));
         let conv = Racing {
             target: target.clone(),
             held: Mutex::new(None),
+            #[cfg(windows)]
+            default_sharing,
         };
 
         let got = cache.get_or_convert(&conv, b"race").unwrap();
