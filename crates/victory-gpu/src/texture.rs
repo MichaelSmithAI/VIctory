@@ -523,7 +523,7 @@ mod tests {
         unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), mem, size) };
     }
 
-    fn copy_buffer_to_texture(queue: This, allocator: This, list: This, dst: This, linear: &[u8]) {
+    fn record_buffer_to_texture(list: This, dst: This, linear: &[u8]) -> This {
         let src = test_buffer(linear.len() as u64);
         let (data, _) = buffer_bytes(src).expect("buffer bytes");
         // SAFETY: `src` is a committed buffer of `linear.len()` bytes.
@@ -547,6 +547,11 @@ mod tests {
             slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
             S_OK
         );
+        src
+    }
+
+    fn copy_buffer_to_texture(queue: This, allocator: This, list: This, dst: This, linear: &[u8]) {
+        let src = record_buffer_to_texture(list, dst, linear);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
         assert_eq!(
             slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(
@@ -795,6 +800,47 @@ mod tests {
         assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
         // SAFETY: `image` is released; freeing our allocation.
         unsafe { VirtualFree(mem.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// A discarded recording cannot supersede title data it never copied.
+    #[test]
+    fn an_unsubmitted_texture_copy_does_not_suppress_title_upload() {
+        let Some(host) = host() else {
+            eprintln!("unsubmitted texture copy skipped: no D3D12 device");
+            return;
+        };
+        for record_copy in [false, true] {
+            let mut backing = vec![0u8; 64 << 10];
+            let mem = backing.as_mut_ptr();
+            let image = test_texture_at(mem as u64, u64::from(W), H, RGBA8, 0);
+            let (_, desc) = texture_memory(image).expect("texture memory");
+            let layout_size = texture_layout(&desc).expect("layout").planes[0].layout.size as usize;
+            assert!(layout_size <= backing.len());
+
+            let old = pattern(0x10);
+            let title = pattern(0x50);
+            let unused_copy = pattern(0x90);
+            write_tiled(image, mem, layout_size, &old);
+            run_upload(host, image);
+            // Keep COPY_DEST, so recording and discarding a subsequent copy
+            // requires no destination state change before the actual upload.
+            write_tiled(image, mem, layout_size, &title);
+            if record_copy {
+                let (queue, allocator, list) = make_queue_and_list();
+                let src = record_buffer_to_texture(list, image, &unused_copy);
+                assert_eq!(slot::<Release>(list, 0x10)(list), 0);
+                assert_eq!(slot::<Release>(src, 0x10)(src), 0);
+                assert_eq!(slot::<Release>(allocator, 0x10)(allocator), 0);
+                assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
+            }
+
+            run_upload(host, image);
+            let label = if record_copy { "discarded recording" } else { "no recording" };
+            assert_rows_eq(&read_back(host, image), &title, label);
+            assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+            eprintln!("{label}: title pixels reached the host");
+        }
+        eprintln!("unsubmitted texture copy readback completed");
     }
 
     /// An unwatched texture (physical-page view / content-hashed path) also
