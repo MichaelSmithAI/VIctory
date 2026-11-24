@@ -1726,7 +1726,7 @@ mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY).unwrap();
         (shader, used)
     }
 
@@ -1809,7 +1809,7 @@ mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY).unwrap();
         (shader, native.used)
     }
 

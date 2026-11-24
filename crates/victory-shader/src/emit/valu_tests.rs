@@ -149,6 +149,9 @@ fn lower_cs_with(words: &[u32], s4_root: RootType) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })
     .expect("lower");
 
@@ -1214,7 +1217,7 @@ fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
     let st = structure::structure(&p).expect("structure");
     let container = crate::dxbc::build(&[]);
     let c = crate::Container::parse(&container).expect("container");
-    let shader = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+    let shader = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
 
     assert_eq!(shader.root_cbvs, vec![0]);
     assert_eq!(shader.root_srvs, vec![1]);
@@ -1466,7 +1469,7 @@ fn structured_access_through_a_root_uav_reaches_index_times_stride() {
     let st = structure::structure(&p).expect("structure");
     let container = crate::dxbc::build(&[]);
     let c = crate::Container::parse(&container).expect("container");
-    let shader = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+    let shader = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
     assert_eq!(shader.root_uavs, vec![0]);
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -1615,6 +1618,9 @@ fn root_view_reads(op: u32, samples: &[(u32, u32, u32)]) {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })
     .expect("lower");
     let shader = HostShader {

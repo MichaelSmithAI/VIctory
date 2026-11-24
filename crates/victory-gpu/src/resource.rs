@@ -1479,7 +1479,7 @@ mod tests {
                 version: (1, 0),
                 parts: Vec::new(),
             };
-            let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY).unwrap();
             let pso = crate::pipeline::test_compute_pipeline(shader, used);
 
             // Title buffers: two inputs and the output.
