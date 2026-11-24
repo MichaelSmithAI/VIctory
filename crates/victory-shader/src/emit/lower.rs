@@ -4152,13 +4152,21 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
+                let m = match v.src.get(2) {
+                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)).and_then(|lo| {
+                        let st = self.x.st;
+                        st.masks.get(&lo).copied().or_else(|| {
+                            let hi = if self.x.p.wave64 {
+                                inst.read(Reg::S(code + 1))?
+                            } else {
+                                lo
+                            };
+                            st.uniform_mask_bits(lo, hi)
+                        })
+                    }),
                     _ => None,
-                };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
+                }
+                .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -7047,6 +7055,20 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    #[test]
+    fn vector_select_reads_a_uniform_scalar_mask() {
+        let code = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0x8506_80C1, // s_cselect_b32 s6, -1, 0
+            0xD501_0001,
+            0x0019_1287, // v_cndmask_b32_e64 v1, 7, 9, s6
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        lowers(&code, 1 << 15 | 1 << 7).expect("select on a uniform scalar mask");
     }
 
     #[test]

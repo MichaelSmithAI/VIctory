@@ -376,6 +376,22 @@ fn v_med3_f16_matches_rdna2_with_nan() {
     });
 }
 
+#[test]
+fn vector_select_reads_a_uniform_scalar_mask_on_gpu() {
+    let code = [
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0x8506_80C1, // s_cselect_b32 s6, -1, 0
+        0xD501_0000,
+        0x001A_0501, // v_cndmask_b32_e64 v0, v1, v2, s6
+    ];
+    let shader = build_valu_cs(&code);
+    let cases = [[0, 17, 0, 0], [35, 17, 0, 0]];
+    run_cases(&shader, &cases, |backend, n, _, value| {
+        assert_eq!(value, [17, 35][n], "{backend}: scalar mask case {n}");
+        eprintln!("{backend}: scalar mask case {n} returned {value}");
+    });
+}
+
 /// `v_cmp_lg_*` is "less or greater": ordered and not equal, so false when
 /// either operand is a NaN (RDNA2 ISA; the same on gfx1036 hardware).
 #[test]
