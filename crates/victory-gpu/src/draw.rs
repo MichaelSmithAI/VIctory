@@ -352,6 +352,10 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
+        if !p.supports_input_topology(D3D_PRIMITIVE_TOPOLOGY(self.topology as i32)) {
+            once!(topology = self.topology, "a triangle geometry stage with another input topology");
+            return false;
+        }
         if !self.bind(list, p, false) {
             return false;
         }
