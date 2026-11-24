@@ -937,3 +937,40 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn scalar_immediate_comparisons_use_signed_or_unsigned_simm16() {
+    // GFX1030 SOPK compares s0 with 0xffff. The signed instructions see -1,
+    // and the unsigned instructions see 65535. Consume SCC in s_cselect.
+    let cases = [u32::MAX - 1, u32::MAX, 0, 65_534, 65_535, 65_536].map(|value| [value, 0, 0, 0]);
+    let truth = [
+        [false, true, false], // eq
+        [true, false, true],  // lg
+        [false, false, true], // gt
+        [false, true, true],  // ge
+        [true, false, false], // lt
+        [true, true, false],  // le
+    ];
+    let order = [
+        [0, 1, 2, 2, 2, 2], // signed: relative to -1
+        [2, 2, 0, 0, 1, 2], // unsigned: relative to 65535
+    ];
+    for (kind, order) in order.iter().enumerate() {
+        for (predicate, truth) in truth.iter().enumerate() {
+            let op = 3 + (kind * 6 + predicate) as u32;
+            let shader = build_valu_cs(&[
+                0xB000_FFFF | (op << 23),
+                0x8507_8081, // s_cselect_b32 s7, 1, 0
+                vop1(0x001, 0, sgpr(7)),
+            ]);
+            run_cases(&shader, &cases, |backend, i, input, got| {
+                assert_eq!(
+                    got,
+                    u32::from(truth[order[i]]),
+                    "{backend}: SOPK comparison opcode {op:#x}, s0 {:#010x}",
+                    input[0],
+                );
+            });
+        }
+    }
+}
