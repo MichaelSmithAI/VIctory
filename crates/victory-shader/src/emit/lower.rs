@@ -225,6 +225,8 @@ struct Lower<'a> {
     /// The host's guard slots ([`Lower::heap_guard`]), view heap then
     /// sampler heap, read once.
     guard_slots: [Option<V>; 2],
+    /// The view heap's end of mirrored title slots (see [`Lower::heap_guard`]).
+    title_end: Option<V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -519,6 +521,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             guard_slots: [None; 2],
+            title_end: None,
         }
     }
 
@@ -3528,7 +3531,19 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        let title = self.direct(a.param);
+        Ok(self.heap_guard(index, sampler, title))
+    }
+
+    /// Whether descriptor loads through parameter `param` index the heap
+    /// directly (its root is the heap itself, not a table): the index is a
+    /// title slot, so it lies below the mirrored title slots or is wrong.
+    fn direct(&self, param: usize) -> bool {
+        matches!(
+            self.x.native.layout.get(param).map(|p| p.root),
+            Some(RootType::ResourceHeap)
+        )
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -3569,7 +3584,8 @@ impl<'a> Lower<'a> {
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         let index = self.s.m.bin(c, Bin::LShr, addr, shift);
-        Ok(self.heap_guard(index, sampler))
+        let title = self.direct(a.param);
+        Ok(self.heap_guard(index, sampler, title))
     }
 
     /// `index` where it lies in the bound heap, else the heap's guard slot.
@@ -3582,7 +3598,15 @@ impl<'a> Lower<'a> {
     /// user data (an entry of the heap's [`RootType`]): past every slot a
     /// title or table uses, null in a view heap; any sampler in a sampler
     /// heap. Indices at or above it read it.
-    fn heap_guard(&mut self, index: V, sampler: bool) -> V {
+    ///
+    /// A `title` index (the heap read directly, not through a table) is a
+    /// title slot, and the host mirrors title slots at their own index only
+    /// below its count of them: past that come its dynamic slots, where
+    /// fresh tables live. So a title index at or above that count (a second
+    /// `ResourceHeap` entry, dword 1) reads the guard too, not some table's
+    /// descriptor. Below a capped heap's count that is every slot the host
+    /// has for the title; uncapped, every title slot.
+    fn heap_guard(&mut self, index: V, sampler: bool, title: bool) -> V {
         let guard = match self.guard_slots[usize::from(sampler)] {
             Some(g) => g,
             None => {
@@ -3616,8 +3640,38 @@ impl<'a> Lower<'a> {
                 g
             }
         };
+        let bound = if title && !sampler {
+            match self.title_end {
+                Some(e) => e,
+                None => {
+                    let after = self
+                        .x
+                        .native
+                        .layout
+                        .iter()
+                        .map(|p| u32::from(p.user_data) + p.sgprs)
+                        .max()
+                        .unwrap_or(0);
+                    let at = after + 2;
+                    self.user_reads.insert(
+                        at,
+                        UserData {
+                            index: at,
+                            slot: 0,
+                            root: RootType::ResourceHeap,
+                            dword: 1,
+                        },
+                    );
+                    let e = self.user_dword(at);
+                    self.title_end = Some(e);
+                    e
+                }
+            }
+        } else {
+            guard
+        };
         let c = self.cur;
-        let inside = self.s.m.cmp(c, pred::IULT, index, guard);
+        let inside = self.s.m.cmp(c, pred::IULT, index, bound);
         self.s.m.select(c, inside, index, guard)
     }
 

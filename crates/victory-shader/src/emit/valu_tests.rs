@@ -88,6 +88,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// layout: 4 root constants in `s0..s3`, the address of a table holding a
 /// UAV in `s4`.
 fn lower_cs(words: &[u32]) -> HostShader {
+    lower_cs_with(words, RootType::Table)
+}
+
+/// [`lower_cs`] with `s4` a parameter of root type `s4_root` (a table
+/// address, or the view heap's address for code indexing it directly).
+fn lower_cs_with(words: &[u32], s4_root: RootType) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -103,7 +109,7 @@ fn lower_cs(words: &[u32]) -> HostShader {
                 slot: 0,
             },
             RootParam {
-                root: RootType::Table,
+                root: s4_root,
                 table_offset_dwords: 0,
                 sgprs: 1,
                 base_register: 0,
@@ -113,7 +119,7 @@ fn lower_cs(words: &[u32]) -> HostShader {
         ],
         used: vec![UsedResource {
             kind: ResourceType::Uav,
-            root: RootType::Table,
+            root: s4_root,
             table_offset_dwords: 0,
             lower_bound: 0,
             stride: 0,
@@ -213,6 +219,80 @@ fn run_cases(
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             check(label, i, inputs, out[0][0]);
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A title index (code reading the view heap directly) past the slots the
+/// host mirrors for the title reads the guard slot, not the host slot
+/// there: past a capped heap's title slots come its dynamic ones, where
+/// fresh tables live (#747), so the store would land in some table's
+/// descriptor. Here slot 0 is the title's last mirrored slot, slot 1 stands
+/// for a dynamic one, slot 2 is the null guard.
+#[test]
+fn a_title_index_past_the_mirrored_slots_reads_the_guard_slot() {
+    let words = [
+        s_mov_b32(5, 0x80),     // s5 = 0
+        sop2(0x1E, 6, 0, 0x85), // s_lshl_b32 s6, s0, 5: the index from data
+        // s_load_dwordx4 s[8:11], s[4:5], s6
+        s_load_dwordx4(8, 4)[0],
+        6 << 25,
+        vop1(0x001, 0, 0x87), // v_mov_b32 v0, 7
+        buffer_store_dword(0, 8, 0)[0],
+        buffer_store_dword(0, 8, 0)[1],
+        S_ENDPGM,
+    ];
+    let shader = lower_cs_with(&words, RootType::ResourceHeap);
+    let mut heap: Vec<_> = shader
+        .user_data
+        .iter()
+        .filter(|u| u.root == RootType::ResourceHeap)
+        .map(|u| u.dword)
+        .collect();
+    heap.sort_unstable();
+    assert_eq!(
+        heap,
+        [0, 1],
+        "the guard and the title end: {:?}",
+        shader.user_data
+    );
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for index in [0u32, 1, 2, 1 << 25] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.dword) {
+                    (RootType::Constants, 0) => index,
+                    (RootType::Constants, _) => 0,
+                    (RootType::ResourceHeap, 0) => 2, // the guard
+                    (RootType::ResourceHeap, 1) => 1, // the title end
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1), View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let want = [u32::from(index == 0) * 7, 0];
+            assert_eq!([out[0][0], out[1][0]], want, "{label}: index {index:#x}");
         }
         ran += 1;
     }
