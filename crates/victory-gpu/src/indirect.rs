@@ -60,12 +60,26 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
+    // Saturate the shared budget instead of allowing uint wraparound.
+    // All accesses to the counter are atomic; a rejected record must
+    // never reopen the budget for later records.
     uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+    budget.InterlockedAdd(0, 0u, before);
+    [allow_uav_condition]
+    while (true) {
+        if (before >= BUDGET) break;
+        uint remaining = BUDGET - before;
+        uint next = before + min(cost, remaining);
+        uint observed;
+        budget.InterlockedCompareExchange(0, before, next, observed);
+        if (observed == before) {
+            if (cost <= remaining) return;
+            break;
+        }
+        before = observed;
     }
+    // Draws keep their layout with no vertices; groups become zero.
+    args.Store(at, 0);
 }
 "#;
 
