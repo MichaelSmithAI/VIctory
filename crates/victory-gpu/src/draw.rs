@@ -664,21 +664,41 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let n = used
+            let offsets: std::collections::BTreeSet<_> = used
                 .iter()
                 .filter(tables)
                 .filter(|u| u.slot == slot)
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
+                .map(|u| u.table_offset_dwords / 8)
+                .collect();
+            let n = offsets.last().map_or(1, |offset| offset + 1);
+            if !self
+                .heap_of(table)
+                .is_some_and(|heap| heap.contains_view_table(table, n))
+            {
+                once!(
+                    slot,
+                    n,
+                    "a constant-buffer table lies outside its title heap"
+                );
+                self.table_failed = true;
+                return Vec::new();
+            }
             let needs_fresh = (0..n).any(|k| {
-                matches!(
-                    crate::descriptor::view(table + u64::from(k) * 32),
-                    Some(View::Constant(address, size))
-                        if size == 0
-                            || !crate::shadow::find(address, u64::from(size.next_multiple_of(256)))
-                                .is_some_and(|s| s.gpu(address).is_multiple_of(256))
-                )
+                let Some(view) = crate::descriptor::view(table + u64::from(k) * 32) else {
+                    return false;
+                };
+                // Fresh tables materialize unnamed entries within their span.
+                if !offsets.contains(&k) {
+                    return true;
+                }
+                if let View::Constant(address, size) = view {
+                    let span = u64::from(size).next_multiple_of(256);
+                    return size == 0
+                        || !crate::shadow::find(address, u64::from(size)).is_some_and(|s| {
+                            s.gpu(address).is_multiple_of(256) && s.left(address) >= span
+                        });
+                }
+                false
             });
             if needs_fresh {
                 fresh.push(slot);
@@ -1289,24 +1309,39 @@ mod tests {
         let props = [2u32, 0, 0, 0, 0]; // UPLOAD heap
         let buf_desc = [
             1u32, // BUFFER
-            0, 0, 0, 4096, 0, // alignment=0, width=4096
-            1, 0x0001_0001, 0, 1, 0, 1, 0, 0,
+            0,
+            0,
+            0,
+            4096,
+            0, // alignment=0, width=4096
+            1,
+            0x0001_0001,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
         ];
-        let mut buf: This = null;
-        let res_iid = ID3D12Resource::IID;
-        assert_eq!(
-            crate::resource::create_committed(
-                null,
-                props.as_ptr().cast(),
-                0,
-                buf_desc.as_ptr().cast(),
-                0,
-                null.cast(),
-                std::ptr::from_ref(&res_iid).cast(),
-                &mut buf,
-            ),
-            S_OK
-        );
+        let make_buffer = || {
+            let mut buf: This = null;
+            let res_iid = ID3D12Resource::IID;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    props.as_ptr().cast(),
+                    0,
+                    buf_desc.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    std::ptr::from_ref(&res_iid).cast(),
+                    &mut buf,
+                ),
+                S_OK
+            );
+            buf
+        };
+        let buf = make_buffer();
         let (data, len) = crate::resource::buffer_bytes(buf).expect("buffer bytes");
         assert!(len >= 4096);
         let base = data as u64;
@@ -1340,7 +1375,10 @@ mod tests {
         state.set_table(false, 0, heap_start);
         let made = state.tables(&list, &used, false);
         assert!(!state.table_failed);
-        assert!(made.is_empty(), "aligned CBV table should not allocate dynamic slots");
+        assert!(
+            made.is_empty(),
+            "aligned CBV table should not allocate dynamic slots"
+        );
         assert!(state.dynamic.is_empty());
 
         // 2) Misaligned (+16) CBV table: allocates dynamic slots.
@@ -1354,9 +1392,126 @@ mod tests {
         state.set_table(false, 0, heap_start + 64);
         let made = state.tables(&list, &used, false);
         assert!(!state.table_failed);
-        assert_eq!(made.len(), 1, "CBV padded past shadow end must use dynamic slots");
+        assert_eq!(
+            made.len(),
+            1,
+            "CBV padded past shadow end must use dynamic slots"
+        );
         assert_eq!(state.dynamic.len(), 2);
 
+        // A populated intermediate entry without a fixed used row stays on
+        // the fresh path, where dynamically addressed entries are made too.
+        write_cbv(4, base, 256);
+        write_cbv(5, base + 256, 256);
+        write_cbv(6, base + 512, 256);
+        state.set_table(false, 0, heap_start + 4 * 32);
+        let with_last = [
+            used[0],
+            UsedResource {
+                table_offset_dwords: 16,
+                ..used[0]
+            },
+        ];
+        assert_eq!(state.tables(&list, &with_last, false).len(), 1);
+
         list.close();
+        drop(state);
+        drop(list);
+
+        let out = make_buffer();
+        let (output, _) = crate::resource::buffer_bytes(out).unwrap();
+        let uav: [u32; 10] = [0, 1, 0, 0, 64, 4, 0, 0, 0, 0];
+        crate::descriptor::create_uav(null, out, null, &uav, heap_start + 3 * 32);
+        let pso = cbv_readback_pipeline(used[0]);
+        for (offset, expected) in [(0, 17u32), (0, 29), (16, 43)] {
+            let list = host.new_list().expect("host list");
+            let mut state = State::default();
+            state.set_heaps(&[heap_obj]);
+            state.set_pipeline(pso);
+            state.set_table(true, 0, heap_start + u64::from(offset != 0) * 32);
+            state.set_table(true, 1, heap_start + 3 * 32);
+            state.dispatch(&list, 1, 1, 1);
+            assert_eq!(state.dynamic.len(), usize::from(offset != 0));
+            let input = data.wrapping_add(offset).cast::<u32>();
+            // SAFETY: both words are aligned and within their live guest buffers.
+            unsafe { input.write_volatile(expected) };
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(unsafe { output.cast::<u32>().read_volatile() }, expected);
+        }
+        for object in [pso, buf, out, heap_obj] {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
+                0
+            );
+        }
+    }
+
+    fn cbv_readback_pipeline(cbv: UsedResource) -> This {
+        use victory_shader::native::{ComputeIo, HwStage, StageIo};
+        use victory_shader::{Container, NativeProgram, RootParam};
+
+        let words: [u32; 17] = [
+            0xBE84_0300,
+            0xBE85_0380, // s[4:5] = slot 0 address
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBE86_0301,
+            0xBE87_0380, // s[6:7] = slot 1 address
+            0xF408_0303,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF420_0404,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_0210, // v_mov_b32 v1, s16
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE070_2000, 0x8003_0100, // buffer_store_dword v1, v0, s[12:15], 0 idxen
+            0xBF81_0000, // s_endpgm
+        ];
+        let code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let used = vec![
+            cbv,
+            UsedResource {
+                kind: ResourceType::Uav,
+                stride: 4,
+                user_data: 1,
+                slot: 1,
+                ..cbv
+            },
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: (0..2)
+                .map(|i| RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: i,
+                    slot: i,
+                })
+                .collect(),
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = victory_shader::ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let res =
+            victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        crate::pipeline::test_compute_pipeline(shader, used)
     }
 }
