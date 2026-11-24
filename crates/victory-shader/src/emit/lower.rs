@@ -448,7 +448,7 @@ impl<'a> Lower<'a> {
             // of 8, 32 or 4): the rest may read the other half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
-                    || i.name() == "ds_bpermute_b32"
+                    || matches!(i.name(), "ds_bpermute_b32" | "v_permlanex16_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
             let whole = |i: &Inst| {
@@ -5205,6 +5205,44 @@ impl<'a> Lower<'a> {
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
+            }
+            "v_permlanex16_b32" => {
+                // Each lane reads src0 of a lane of the *other* row of 16 in
+                // its 32-lane half; lane i's pick is nibble i of the {src2,
+                // src1} selector (v_permlane16_b32 reads the same row). Both
+                // stay inside a 32-lane half, so the lane math is unchanged
+                // when a console wave64 program runs as two wave32 halves.
+                if v.opsel != 0 {
+                    return Err("op_sel on v_permlanex16_b32");
+                }
+                if guard.is_some() || self.s.threads.is_some_and(|t| t.iter().product::<u32>() % 32 != 0) {
+                    return Err("v_permlanex16_b32 with inactive lanes");
+                }
+                let (a, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                self.cross_lane(false)?;
+                let lane = self.lane_index();
+                let (k2, k8, k15, k16, k31, n31) = (
+                    self.s.m.i32(2),
+                    self.s.m.i32(8),
+                    self.s.m.i32(15),
+                    self.s.m.i32(16),
+                    self.s.m.i32(31),
+                    self.s.m.i32(!31),
+                );
+                let nib = self.s.m.bin(c, Bin::And, lane, k15);
+                let sh = self.s.m.bin(c, Bin::Shl, nib, k2);
+                let sh = self.s.m.bin(c, Bin::And, sh, k31);
+                let top = self.s.m.cmp(c, pred::IUGE, nib, k8);
+                let word = self.s.m.select(c, top, hi, lo);
+                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let half = self.s.m.bin(c, Bin::And, lane, n31);
+                let row = self.s.m.bin(c, Bin::And, lane, k16);
+                let row = self.s.m.bin(c, Bin::Xor, row, k16);
+                let base = self.s.m.bin(c, Bin::Or, half, row);
+                let idx = self.s.m.bin(c, Bin::Or, base, pick);
+                let val = self.read_lane(a, idx);
+                int(self, val)
             }
             "v_readfirstlane_b32"
                 if inst
