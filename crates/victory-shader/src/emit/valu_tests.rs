@@ -1353,6 +1353,7 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             root_srvs: Vec::new(),
             root_uavs: slots.to_vec(),
             table_reads: Vec::new(),
+            group_waves: 1,
         }
     };
 
@@ -1634,6 +1635,7 @@ fn root_view_reads(op: u32, samples: &[(u32, u32, u32)]) {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         table_reads: lowered.table_reads,
+        group_waves: lowered.group_waves,
     };
     assert_eq!(shader.root_srvs, [2]);
     assert!(
