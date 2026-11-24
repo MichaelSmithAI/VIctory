@@ -1082,6 +1082,9 @@ fn a_heap_index_past_the_heap_reads_the_guard_slot() {
         let want = if i == 0 { 7 } else { 0 };
         assert_eq!(got, want, "{label}: index {:#x}", k[0]);
     });
+}
+
+#[test]
 fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
     let s_load_dword = |dst: u8, base: u8, byte_off: u32| -> [u32; 2] {
         [
@@ -1206,7 +1209,7 @@ fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let container = crate::dxbc::build(&[]);
@@ -1345,6 +1348,7 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: slots.to_vec(),
+            table_reads: Vec::new(),
         }
     };
 
@@ -1457,7 +1461,7 @@ fn structured_access_through_a_root_uav_reaches_index_times_stride() {
         code,
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let container = crate::dxbc::build(&[]);
@@ -1598,7 +1602,7 @@ fn root_view_reads(op: u32, samples: &[(u32, u32, u32)]) {
         code,
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let lowered = lower::lower(&lower::Parts {
@@ -1622,6 +1626,7 @@ fn root_view_reads(op: u32, samples: &[(u32, u32, u32)]) {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        table_reads: lowered.table_reads,
     };
     assert_eq!(shader.root_srvs, [2]);
     assert!(
