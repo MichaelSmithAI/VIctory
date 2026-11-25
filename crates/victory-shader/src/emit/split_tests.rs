@@ -106,14 +106,21 @@ fn run_with_views(
     Ok(out.into_iter().next().unwrap_or_default())
 }
 
+fn hardware_adapters() -> Vec<String> {
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        eprintln!("VICTORY_WARP=1; skipping hardware adapters");
+        return Vec::new();
+    }
+    adapters().unwrap_or_else(|e| {
+        eprintln!("no DXGI; skipped: {e}");
+        Vec::new()
+    })
+}
+
 #[test]
 fn in_half_lane_reads_match_the_console_on_every_adapter() {
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
     let mut ran = 0;
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else {
             eprintln!("{name}: no SM 6.6 device; skipped");
             continue;
@@ -195,11 +202,7 @@ fn program_3d_of(threads: [u32; 3], core: &[u32]) -> crate::NativeProgram {
 
 #[test]
 fn three_dimensional_groups_keep_the_consoles_lanes() {
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
@@ -241,11 +244,7 @@ fn program_case(label: &str, p: &crate::NativeProgram, want: impl Fn(u32) -> u32
         unreachable!()
     };
     let threads = io.threads[0];
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
@@ -387,10 +386,7 @@ fn groups_of_several_console_waves_run_as_one_host_group_each() {
     // 2-D and 3-D groups: the console forms its waves from the flat thread
     // id, which the three ids give (v4); lane 40 of each wave holds
     // 64 * wave + 40.
-    let Ok(names) = adapters() else {
-        return;
-    };
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
@@ -1098,11 +1094,7 @@ fn selects_on_masks_held_as_numbers() {
         0xD501_0002,
         0x002A_0101, // v_cndmask_b32 v2, v1, v0, s[10:11]
     ];
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
@@ -1328,11 +1320,9 @@ fn mask_grown_inside_a_branch_counted_after_it() {
     );
 }
 
-/// The wave32 form of `loop_exit_mask_counted_after_the_loop`: a 32-lane
-/// wave whose lanes leave a loop at different iterations, its exit mask
-/// (one dword, grown from 0) counted after the loop: all 32 lanes.
-#[test]
-fn wave32_loop_exit_mask_counted_after_the_loop() {
+/// The wave32 form of `loop_exit_mask_counted_after_the_loop`, with one
+/// dword of mask per wave.
+fn wave32_exit_mask_program(threads: u32) -> crate::NativeProgram {
     let body = [
         0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
         0xBE8A_0380, // s_mov_b32 s10, 0
@@ -1345,9 +1335,36 @@ fn wave32_loop_exit_mask_counted_after_the_loop() {
         0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
-    let mut p = program(&body, 32);
+    let mut p = program(&body, threads);
     p.wave64 = false;
+    p
+}
+
+#[test]
+fn wave32_loop_exit_mask_counted_after_the_loop() {
+    let p = wave32_exit_mask_program(32);
     program_case("wave32 loop exit mask counted", &p, |_| 32, true);
+}
+
+#[test]
+fn wave32_loop_exit_mask_counts_a_partial_second_wave() {
+    let p = wave32_exit_mask_program(48);
+    let groups = 3;
+    let expected: Vec<u32> = (0..groups)
+        .flat_map(|_| (0..48).map(|lane| if lane < 32 { 32 } else { 16 }))
+        .collect();
+    for name in hardware_adapters() {
+        let Ok(host) = Host::on(&name) else { continue };
+        // This case checks native Wave32 execution. WARP can report
+        // incorrect active-lane counts for a partial wave.
+        if host.reported_target().is_some_and(|target| target.runs(32)) {
+            let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(out, expected, "{name}: partial Wave32 exit mask");
+            eprintln!("{name}: all {} lane counts exact", out.len());
+        } else {
+            eprintln!("{name}: native Wave32 support not reported; skipped");
+        }
+    }
 }
 
 /// `v_readfirstlane_b32 s12, v4` of v4 = 3t + 7, inside `if (t >= 10)`:
@@ -1376,12 +1393,8 @@ const ENTRY_FIRST_LANE: &[u32] = &[
 
 #[test]
 fn first_lane_reads_span_the_console_wave_on_wave32_hosts() {
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipping Wave32 readback");
-        return;
-    };
     let mut ran = false;
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else { continue };
         let target = host.target();
         if !target.runs(32) || target.runs(64) {
@@ -1463,7 +1476,7 @@ fn first_lane_reads_of_uniform_scalar_loads_stay_per_lane() {
             wave_size(&emit_for(&unproven, target).unwrap().dxil),
             Some(32)
         );
-        for name in adapters().unwrap_or_default() {
+        for name in hardware_adapters() {
             let Ok(host) = Host::on(&name) else { continue };
             if !host.target().runs(32) || host.target().runs(64) {
                 continue;

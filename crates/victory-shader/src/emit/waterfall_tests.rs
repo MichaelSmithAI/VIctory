@@ -434,7 +434,8 @@ fn a_first_lane_read_with_joined_descriptors_falls_back_to_the_per_lane_form() {
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
         {
-            v.validate(&mut shader.dxil).expect("DXIL validation failed");
+            v.validate(&mut shader.dxil)
+                .expect("DXIL validation failed");
         }
     }
 }
