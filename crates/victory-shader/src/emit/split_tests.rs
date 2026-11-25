@@ -1320,11 +1320,9 @@ fn mask_grown_inside_a_branch_counted_after_it() {
     );
 }
 
-/// The wave32 form of `loop_exit_mask_counted_after_the_loop`: a 32-lane
-/// wave whose lanes leave a loop at different iterations, its exit mask
-/// (one dword, grown from 0) counted after the loop: all 32 lanes.
-#[test]
-fn wave32_loop_exit_mask_counted_after_the_loop() {
+/// The wave32 form of `loop_exit_mask_counted_after_the_loop`, with one
+/// dword of mask per wave.
+fn wave32_exit_mask_program(threads: u32) -> crate::NativeProgram {
     let body = [
         0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
         0xBE8A_0380, // s_mov_b32 s10, 0
@@ -1337,7 +1335,35 @@ fn wave32_loop_exit_mask_counted_after_the_loop() {
         0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
-    let mut p = program(&body, 32);
+    let mut p = program(&body, threads);
     p.wave64 = false;
+    p
+}
+
+#[test]
+fn wave32_loop_exit_mask_counted_after_the_loop() {
+    let p = wave32_exit_mask_program(32);
     program_case("wave32 loop exit mask counted", &p, |_| 32, true);
+}
+
+#[test]
+fn wave32_loop_exit_mask_counts_a_partial_second_wave() {
+    let Ok(names) = adapters() else {
+        return;
+    };
+    let p = wave32_exit_mask_program(48);
+    let groups = 3;
+    let expected: Vec<u32> = (0..groups)
+        .flat_map(|_| (0..48).map(|lane| if lane < 32 { 32 } else { 16 }))
+        .collect();
+    for name in names {
+        let Ok(host) = Host::on(&name) else { continue };
+        // This case checks native Wave32 execution. WARP can report
+        // incorrect active-lane counts for a partial wave.
+        if host.target().runs(32) {
+            let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(out, expected, "{name}: partial Wave32 exit mask");
+            eprintln!("{name}: all {} lane counts exact", out.len());
+        }
+    }
 }
